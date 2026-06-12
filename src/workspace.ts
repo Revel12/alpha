@@ -56,14 +56,48 @@ export async function readText(uri: vscode.Uri, maxBytes: number): Promise<strin
 
 export async function writeText(uri: vscode.Uri, text: string): Promise<void> {
   ensureInsideWorkspace(uri);
+  await ensureParentDirectory(uri);
   await vscode.workspace.fs.writeFile(uri, Buffer.from(text, "utf8"));
 }
 
+export async function stat(uri: vscode.Uri): Promise<vscode.FileStat> {
+  ensureInsideWorkspace(uri);
+  return vscode.workspace.fs.stat(uri);
+}
+
+export async function readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
+  ensureInsideWorkspace(uri);
+  return vscode.workspace.fs.readDirectory(uri);
+}
+
 export function lineRange(document: vscode.TextDocument, startLineOneBased: number, endLineOneBased: number): vscode.Range {
+  if (startLineOneBased < 1 || endLineOneBased < startLineOneBased || startLineOneBased > document.lineCount) {
+    throw new Error(`Invalid line range ${startLineOneBased}..${endLineOneBased} for ${document.lineCount} line document.`);
+  }
+
   const start = Math.max(0, startLineOneBased - 1);
   const endExclusive = Math.min(document.lineCount, Math.max(start + 1, endLineOneBased));
   return new vscode.Range(
     new vscode.Position(start, 0),
     document.lineAt(endExclusive - 1).rangeIncludingLineBreak.end,
   );
+}
+
+export function insertionPosition(document: vscode.TextDocument, lineOneBased: number, side: "before" | "after"): vscode.Position {
+  if (lineOneBased < 1) {
+    throw new Error(`Invalid insertion line ${lineOneBased}.`);
+  }
+
+  if (side === "before") {
+    const line = Math.max(0, Math.min(document.lineCount, lineOneBased - 1));
+    return new vscode.Position(line, 0);
+  }
+  const line = Math.max(0, Math.min(document.lineCount - 1, lineOneBased - 1));
+  return document.lineAt(line).rangeIncludingLineBreak.end;
+}
+
+async function ensureParentDirectory(uri: vscode.Uri): Promise<void> {
+  const parent = vscode.Uri.file(path.dirname(uri.fsPath));
+  ensureInsideWorkspace(parent);
+  await vscode.workspace.fs.createDirectory(parent);
 }

@@ -55,8 +55,8 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     visibility: "public",
     enabled: true,
     description: "Apply OMP-style hashline edits after validating the file hash and target range.",
-    inputSchema: objectSchema({ patch: stringProperty("Hashline edit patch to apply.") }, ["patch"]),
-    toArgs: (input) => requiredString(input, "patch"),
+    inputSchema: objectSchema({ input: stringProperty("OMP-style hashline edit input.") }, ["input"]),
+    toArgs: (input) => requiredString(input, "input"),
   },
   {
     name: "write",
@@ -76,19 +76,16 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     name: "resolve",
     visibility: "hidden",
     enabled: true,
-    description: "List, apply, or clear pending Alpha edits.",
+    description: "Apply or discard the pending Alpha preview action.",
     inputSchema: objectSchema(
       {
-        op: { type: "string", enum: ["list", "apply", "clear"], description: "Pending edit operation." },
-        id: stringProperty("Pending edit id for apply."),
+        action: { type: "string", enum: ["apply", "discard"], description: "Resolution action for pending preview work." },
+        reason: stringProperty("Brief reason for applying or discarding the pending work."),
+        extra: { type: "object", description: "Optional workflow-specific resolution data." },
       },
-      [],
+      ["action", "reason"],
     ),
-    toArgs: (input) => {
-      const op = optionalString(input, "op") || "list";
-      const id = optionalString(input, "id");
-      return id ? `${op} ${id}` : op;
-    },
+    toArgs: (input) => JSON.stringify(input),
   },
   {
     name: "todo",

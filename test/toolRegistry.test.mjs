@@ -31,3 +31,17 @@ test("registry names are unique", () => {
 
   assert.equal(new Set(names).size, names.length);
 });
+
+test("edit uses the OMP-style input field", () => {
+  const edit = getAlphaToolRegistration("edit");
+
+  assert.deepEqual(edit.inputSchema.required, ["input"]);
+  assert.equal(edit.inputSchema.properties.input.type, "string");
+});
+
+test("resolve uses the hidden OMP-style action contract", () => {
+  const resolve = getAlphaToolRegistration("resolve");
+
+  assert.deepEqual(resolve.inputSchema.required, ["action", "reason"]);
+  assert.deepEqual(resolve.inputSchema.properties.action.enum, ["apply", "discard"]);
+});
