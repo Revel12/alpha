@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { applyWorkspaceEdits } from "./patch/hashline";
 import { InMemoryPendingEditStore, InMemoryTodoStore } from "./store";
 import type { AlphaContext } from "./types";
+import { answerWithAlphaTools } from "./lmTools";
 import { toolHelp, tools } from "./tools";
 
 const pendingEdits = new InMemoryPendingEditStore();
@@ -88,7 +89,7 @@ async function handleAlphaRequest(
 
   try {
     if (!prompt || prompt === "help" || prompt === "/help") {
-      stream.markdown(["Alpha tools:", "", toolHelp(), "", "Use `/read path`, `/search text`, `/edit` with hashline edits, or ask normally."].join("\n"));
+      stream.markdown(["Alpha tools:", "", toolHelp(), "", "Ask naturally, e.g. `read src/foo.ts and explain it`. Slash forms like `/read path` remain available as deterministic shortcuts."].join("\n"));
       return;
     }
 
@@ -104,7 +105,7 @@ async function handleAlphaRequest(
       return;
     }
 
-    await answerWithModel(prompt, alphaContext);
+    await answerWithAlphaTools(prompt, alphaContext);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stream.markdown(`Alpha error: ${message}`);
@@ -112,29 +113,9 @@ async function handleAlphaRequest(
 }
 
 function parseExplicitToolCall(prompt: string): { name: string; args: string } | undefined {
-  const match = prompt.match(/^\/?([a-z_][a-z0-9_]*)\b\s*([\s\S]*)$/i);
+  const match = prompt.match(/^\/([a-z_][a-z0-9_]*)\b\s*([\s\S]*)$/i);
   if (!match) return undefined;
   const name = match[1].toLowerCase();
   if (!tools.some((tool) => tool.name === name)) return undefined;
   return { name, args: match[2] ?? "" };
-}
-
-async function answerWithModel(prompt: string, ctx: AlphaContext): Promise<void> {
-  const messages = [
-    vscode.LanguageModelChatMessage.User(
-      [
-        "You are Alpha, an OMP-style local coding harness inside VS Code.",
-        "Available local tools are not invoked automatically in this prototype; tell the user which /tool command to run when workspace context is needed.",
-        "Keep answers concise and implementation-focused.",
-        "",
-        "Tools:",
-        toolHelp(),
-      ].join("\n"),
-    ),
-    vscode.LanguageModelChatMessage.User(prompt),
-  ];
-  const response = await ctx.request.model.sendRequest(messages, {}, ctx.token);
-  for await (const chunk of response.text) {
-    ctx.stream.markdown(chunk);
-  }
 }

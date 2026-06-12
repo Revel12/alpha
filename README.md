@@ -8,20 +8,22 @@ The important design constraint is that Alpha does not handle GitHub Copilot aut
 
 Use these from Copilot Chat with `@alpha`:
 
-- `/read path` reads a workspace file and emits a hash anchor.
-- `/read active` reads the active editor or selected text.
-- `/search query` searches workspace text.
-- `/find glob` finds workspace files.
-- `/diff` shows git changed files and diff stats.
-- `/edit` applies OMP-style hashline edits.
-- `/write path` followed by file content writes a workspace file.
-- `/resolve list`, `/resolve apply <id>`, `/resolve clear` manages queued edits.
-- `/todo add item`, `/todo in_progress item`, `/todo completed item`, `/todo list` manages local todos.
-- `/review text` sends review text to the selected VS Code/Copilot model.
+Alpha passes a private OMP-style tool set to the selected VS Code/Copilot model. Inside the `@alpha` participant, the model sees only these Alpha tools unless this extension explicitly adds more:
+
+- `read` reads a workspace file and emits a hash anchor.
+- `search` searches workspace text.
+- `find` finds workspace files by glob.
+- `diff` shows git changed files and diff stats.
+- `edit` applies OMP-style hashline edits.
+- `write` writes a workspace file.
+- `resolve` lists, applies, or clears queued edits.
+- `todo` manages local todos.
+
+Slash forms such as `/read path`, `/search query`, `/edit`, and `/todo list` remain available as deterministic shortcuts, but normal use should be natural-language chat with `@alpha`.
 
 ## Hashline Edit Format
 
-Run `/read path` first. It returns an anchor like:
+Ask Alpha to read a file first, or run `/read path`. It returns an anchor like:
 
 ```text
 ¶src/example.ts#abc123def456
@@ -54,4 +56,4 @@ Launch the extension with the `Run Alpha Extension` debug configuration.
 - Add LSP-backed `lsp` operations through VS Code language APIs.
 - Add read-only internal Bitbucket tools.
 - Add local `.alpha` persistence for todos, checkpoints, and memory if approved.
-- Expose selected tools as VS Code language-model tools after the chat participant loop is stable.
+- Add more OMP-style tools: LSP, checkpoint/rewind, browser, Bitbucket, AST search/edit, and memory.
