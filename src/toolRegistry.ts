@@ -37,7 +37,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Read a workspace file, directory, active editor, or selection and return OMP-style [path#TAG] text.",
     inputSchema: objectSchema({ path: stringProperty("Workspace-relative path to read. Use active for the active editor.") }, []),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/read")).readTool,
+    loadTool: async () => (await import("./tools/read.js")).readTool,
     toArgs: (input) => optionalString(input, "path") || "active",
   },
   {
@@ -47,7 +47,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Search text across workspace files.",
     inputSchema: objectSchema({ query: stringProperty("Text to search for across the workspace.") }, ["query"]),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/search")).searchTool,
+    loadTool: async () => (await import("./tools/search.js")).searchTool,
     toArgs: (input) => requiredString(input, "query"),
   },
   {
@@ -57,7 +57,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Find workspace files by glob.",
     inputSchema: objectSchema({ glob: stringProperty("Glob pattern, such as src/**/*.ts.") }, []),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/find")).findTool,
+    loadTool: async () => (await import("./tools/find.js")).findTool,
     toArgs: (input) => optionalString(input, "glob") || "**/*",
   },
   {
@@ -67,7 +67,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Show changed files and git diff stats for the workspace.",
     inputSchema: objectSchema({}, []),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/diff")).diffTool,
+    loadTool: async () => (await import("./tools/diff.js")).diffTool,
     toArgs: () => "",
   },
   {
@@ -77,7 +77,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Default tool for modifying existing files. Applies OMP-style hashline edits after validating the file tag and target range.",
     inputSchema: objectSchema({ input: stringProperty("OMP-style hashline edit input.") }, ["input"]),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/edit")).editTool,
+    loadTool: async () => (await import("./tools/edit.js")).editTool,
     toArgs: (input) => requiredString(input, "input"),
   },
   {
@@ -93,7 +93,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
       ["path", "content"],
     ),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/write")).writeTool,
+    loadTool: async () => (await import("./tools/write.js")).writeTool,
     toArgs: (input) => `${requiredString(input, "path")}\n${requiredString(input, "content")}`,
   },
   {
@@ -110,7 +110,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
       ["action", "reason"],
     ),
     enabled: (ctx) => !ctx || ctx.pendingEdits.list().length > 0,
-    loadTool: async () => (await import("./tools/resolve")).resolveTool,
+    loadTool: async () => (await import("./tools/resolve.js")).resolveTool,
     toArgs: (input) => JSON.stringify(input),
   },
   {
@@ -130,7 +130,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
       [],
     ),
     enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/todo")).todoTool,
+    loadTool: async () => (await import("./tools/todo.js")).todoTool,
     toArgs: (input) => {
       const op = optionalString(input, "op") || "list";
       const text = optionalString(input, "text");
