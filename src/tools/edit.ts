@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { applyWorkspaceEdits, buildWorkspaceEdits } from "../patch/hashline";
 import type { ToolDefinition } from "../types";
-import { readText, relativePath } from "../workspace";
+import { readOpenDocumentText, relativePath } from "../workspace";
 
 export const editTool: ToolDefinition = {
   name: "edit",
@@ -13,7 +13,7 @@ export const editTool: ToolDefinition = {
 
     const before = new Map<string, string>();
     for (const uri of uniqueUris(edits.map((edit) => edit.uri))) {
-      before.set(uri.toString(), await readText(uri, maxBytes));
+      before.set(uri.toString(), await readOpenDocumentText(uri, maxBytes));
     }
 
     const ok = await applyWorkspaceEdits(edits);
@@ -24,7 +24,7 @@ export const editTool: ToolDefinition = {
     let anyChanged = false;
     for (const uri of changedUris) {
       const path = relativePath(uri);
-      const next = await readText(uri, maxBytes);
+      const next = await readOpenDocumentText(uri, maxBytes);
       if (before.get(uri.toString()) !== next) {
         anyChanged = true;
       }

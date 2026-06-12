@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { contentTag } from "../hash";
-import { insertionPosition, lineRange, readText, relativePath, resolveWorkspaceFile } from "../workspace";
+import { insertionPosition, lineRange, readOpenDocumentText, relativePath, resolveWorkspaceFile } from "../workspace";
 import type { FileSnapshotStore, WorkspaceTextEdit } from "../types";
 
 type HashlineOperation = "replace" | "delete" | "insert";
@@ -109,7 +109,7 @@ export async function buildWorkspaceEdits(input: string, maxBytes: number, snaps
       throw new Error(`Unknown snapshot tag ${item.expectedTag} for ${snapshotPath}; run read again before editing.`);
     }
 
-    const content = await readText(uri, maxBytes);
+    const content = await readOpenDocumentText(uri, maxBytes);
     const currentTag = contentTag(content);
     if (currentTag !== item.expectedTag.toUpperCase()) {
       throw new Error(`Content tag mismatch for ${snapshotPath}; expected ${item.expectedTag.toUpperCase()} but current tag is ${currentTag}. Run read again before editing.`);

@@ -54,6 +54,19 @@ export async function readText(uri: vscode.Uri, maxBytes: number): Promise<strin
   return Buffer.from(bytes).toString("utf8");
 }
 
+export async function readOpenDocumentText(uri: vscode.Uri, maxBytes: number): Promise<string> {
+  ensureInsideWorkspace(uri);
+  const open = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
+  if (open) return truncateText(open.getText(), maxBytes);
+
+  try {
+    const document = await vscode.workspace.openTextDocument(uri);
+    return truncateText(document.getText(), maxBytes);
+  } catch {
+    return readText(uri, maxBytes);
+  }
+}
+
 export async function writeText(uri: vscode.Uri, text: string): Promise<void> {
   ensureInsideWorkspace(uri);
   await ensureParentDirectory(uri);
@@ -100,4 +113,10 @@ async function ensureParentDirectory(uri: vscode.Uri): Promise<void> {
   const parent = vscode.Uri.file(path.dirname(uri.fsPath));
   ensureInsideWorkspace(parent);
   await vscode.workspace.fs.createDirectory(parent);
+}
+
+function truncateText(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= maxBytes) return text;
+  return Buffer.from(bytes.subarray(0, maxBytes)).toString("utf8") + "\n...[truncated]";
 }
