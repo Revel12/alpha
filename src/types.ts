@@ -8,6 +8,8 @@ export interface AlphaContext {
   pendingEdits: PendingEditStore;
   todos: TodoStore;
   snapshots: FileSnapshotStore;
+  artifacts: ArtifactStore;
+  bashJobs: BashJobStore;
 }
 
 export interface ToolResult {
@@ -64,5 +66,43 @@ export interface FileSnapshotStore {
   record(path: string, content: string): FileSnapshot;
   get(path: string, tag: string): FileSnapshot | undefined;
   has(path: string, tag: string): boolean;
+  clear(): void;
+}
+
+export interface Artifact {
+  id: string;
+  label: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface ArtifactStore {
+  add(label: string, content: string): Artifact;
+  get(id: string): Artifact | undefined;
+  list(): Artifact[];
+  clear(): void;
+}
+
+export type BashJobStatus = "running" | "completed" | "failed";
+
+export interface BashJob {
+  id: string;
+  command: string;
+  cwd: string;
+  createdAt: string;
+  status: BashJobStatus;
+  output?: string;
+  exitCode?: number | string;
+  timedOut?: boolean;
+  wallTimeMs?: number;
+  artifactId?: string;
+  error?: string;
+}
+
+export interface BashJobStore {
+  add(job: Omit<BashJob, "id" | "createdAt">): BashJob;
+  update(id: string, patch: Partial<Omit<BashJob, "id" | "createdAt">>): BashJob | undefined;
+  get(id: string): BashJob | undefined;
+  list(): BashJob[];
   clear(): void;
 }

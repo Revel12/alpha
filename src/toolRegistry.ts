@@ -52,6 +52,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
         timeout: { type: "number", description: "Timeout in seconds. Default 300; allowed range 1-3600." },
         cwd: stringProperty("Workspace-relative working directory."),
         pty: { type: "boolean", description: "Accepted for OMP schema compatibility; Alpha runs non-PTY commands." },
+        async: { type: "boolean", description: "Run in background. The command is still capped by timeout." },
       },
       ["command"],
     ),

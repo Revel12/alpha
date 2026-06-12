@@ -64,6 +64,22 @@
           "maximum": 2000,
           "description": "Maximum lines returned for a file read without an explicit selector."
         },
+        "alpha.bash.maxVisibleBytes": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "description": "Maximum visible bytes returned by bash before full output is stored as an artifact."
+        },
+        "alpha.bash.interceptDedicatedToolCommands": {
+          "type": "boolean",
+          "default": true,
+          "description": "Block bash commands that should use Alpha read/search/find/edit/write tools."
+        },
+        "alpha.bash.stripTrailingHeadTail": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strip trailing head/tail pipes because Alpha stores full output artifacts."
+        },
         "alpha.tools.discoveryMode": {
           "type": "string",
           "enum": [

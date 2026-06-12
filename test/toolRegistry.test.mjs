@@ -76,6 +76,8 @@ test("bash uses the OMP-style command contract", () => {
   assert.equal(bash.inputSchema.properties.command.type, "string");
   assert.equal(bash.inputSchema.properties.cwd.type, "string");
   assert.equal(bash.inputSchema.properties.timeout.type, "number");
+  assert.equal(bash.inputSchema.properties.async.type, "boolean");
+  assert.equal(bash.inputSchema.properties.pty.type, "boolean");
 });
 
 test("resolve uses the hidden OMP-style action contract", () => {
@@ -98,6 +100,7 @@ test("system prompt includes OMP-style tool priority", () => {
 
   assert.match(prompt, /# Tool Priority/);
   assert.match(prompt, /terminal work.*`bash`/);
+  assert.match(prompt, /artifact:\/\/\.\.\./);
   assert.match(prompt, /surgical existing-file edits -> `edit`, not `write`/);
   assert.match(prompt, /file\/dir reads -> `read`/);
 });

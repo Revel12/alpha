@@ -1,5 +1,16 @@
 import { contentTag } from "./hash";
-import type { FileSnapshot, FileSnapshotStore, PendingEdit, PendingEditStore, TodoItem, TodoStore } from "./types";
+import type {
+  Artifact,
+  ArtifactStore,
+  BashJob,
+  BashJobStore,
+  FileSnapshot,
+  FileSnapshotStore,
+  PendingEdit,
+  PendingEditStore,
+  TodoItem,
+  TodoStore,
+} from "./types";
 
 export class InMemoryPendingEditStore implements PendingEditStore {
   private edits: PendingEdit[] = [];
@@ -69,5 +80,67 @@ export class InMemoryFileSnapshotStore implements FileSnapshotStore {
 
   clear(): void {
     this.snapshots.clear();
+  }
+}
+
+export class InMemoryArtifactStore implements ArtifactStore {
+  private artifacts: Artifact[] = [];
+
+  add(label: string, content: string): Artifact {
+    const artifact: Artifact = {
+      id: `artifact-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      label,
+      content,
+      createdAt: new Date().toISOString(),
+    };
+    this.artifacts.unshift(artifact);
+    this.artifacts = this.artifacts.slice(0, 100);
+    return artifact;
+  }
+
+  get(id: string): Artifact | undefined {
+    return this.artifacts.find((artifact) => artifact.id === id);
+  }
+
+  list(): Artifact[] {
+    return [...this.artifacts];
+  }
+
+  clear(): void {
+    this.artifacts = [];
+  }
+}
+
+export class InMemoryBashJobStore implements BashJobStore {
+  private jobs: BashJob[] = [];
+
+  add(job: Omit<BashJob, "id" | "createdAt">): BashJob {
+    const created: BashJob = {
+      ...job,
+      id: `bash-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: new Date().toISOString(),
+    };
+    this.jobs.unshift(created);
+    this.jobs = this.jobs.slice(0, 100);
+    return created;
+  }
+
+  update(id: string, patch: Partial<Omit<BashJob, "id" | "createdAt">>): BashJob | undefined {
+    const index = this.jobs.findIndex((job) => job.id === id);
+    if (index === -1) return undefined;
+    this.jobs[index] = { ...this.jobs[index], ...patch };
+    return this.jobs[index];
+  }
+
+  get(id: string): BashJob | undefined {
+    return this.jobs.find((job) => job.id === id);
+  }
+
+  list(): BashJob[] {
+    return [...this.jobs];
+  }
+
+  clear(): void {
+    this.jobs = [];
   }
 }

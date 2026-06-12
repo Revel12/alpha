@@ -29,6 +29,10 @@ export const readTool: ToolDefinition = {
       return readActiveEditor(target, ctx);
     }
 
+    if (target.path.startsWith("artifact://")) {
+      return readArtifact(target, ctx);
+    }
+
     const uri = await resolveExistingWorkspacePath(target.path);
     const fileStat = await stat(uri);
 
@@ -83,6 +87,22 @@ export function parseReadTarget(input: string): ReadTarget {
     explicitSelector,
     ranges: rangeSuffix ? parseRanges(rangeSuffix[1]) : undefined,
   };
+}
+
+function readArtifact(target: ReadTarget, ctx: AlphaContext): { markdown: string } {
+  const id = target.path.slice("artifact://".length).replace(/^\/+/, "");
+  if (!id) {
+    const artifacts = ctx.artifacts.list();
+    if (!artifacts.length) return { markdown: "No Alpha artifacts." };
+    return {
+      markdown: ["[artifact://]", "```text", ...artifacts.map((artifact) => `${artifact.id}\t${artifact.label}\t${artifact.createdAt}`), "```"].join("\n"),
+    };
+  }
+
+  const artifact = ctx.artifacts.get(id);
+  if (!artifact) throw new Error(`Artifact not found: artifact://${id}`);
+  if (target.raw) return { markdown: renderRawContent(artifact.content, target.ranges) };
+  return { markdown: renderArtifactContent(id, artifact.label, artifact.content, target.ranges, target.explicitSelector ? undefined : 200) };
 }
 
 async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<{ markdown: string }> {
@@ -157,6 +177,26 @@ function renderContent(path: string, content: string, tag: string, ranges?: Read
     }
   }
   return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+}
+
+function renderArtifactContent(id: string, label: string, content: string, ranges?: ReadRange[], defaultLimit?: number): string {
+  const header = `[artifact://${id} ${label}]`;
+  const lines = content.split(/\r?\n/);
+  const selected: string[] = [];
+  const effectiveRanges = ranges?.length ? ranges : [{ startLine: 1, endLine: defaultLimit ? Math.min(defaultLimit, lines.length) : lines.length }];
+
+  for (const range of effectiveRanges) {
+    const end = Math.min(lines.length, range.endLine ?? lines.length);
+    for (let line = range.startLine; line <= end; line++) {
+      selected.push(`${line}:${lines[line - 1] ?? ""}`);
+    }
+  }
+
+  if (!ranges?.length && defaultLimit && lines.length > defaultLimit) {
+    selected.push(`[${lines.length - defaultLimit} lines elided; re-read needed ranges, e.g. artifact://${id}:${defaultLimit + 1}-${Math.min(lines.length, defaultLimit + 80)}]`);
+  }
+
+  return [header, "```text", ...selected, "```"].join("\n");
 }
 
 function renderRawContent(content: string, ranges?: ReadRange[]): string {
