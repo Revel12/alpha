@@ -71,6 +71,7 @@
   },
   "scripts": {
     "compile": "tsc -p .",
+    "test": "npm run compile && node --test test/*.test.mjs",
     "watch": "tsc -watch -p ."
   },
   "devDependencies": {
