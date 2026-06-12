@@ -19,27 +19,24 @@ Alpha passes a private OMP-style tool set to the selected VS Code/Copilot model.
 - `resolve` lists, applies, or clears queued edits.
 - `todo` manages local todos.
 
-Slash forms such as `/read path`, `/search query`, `/edit`, and `/todo list` remain available as deterministic shortcuts, but normal use should be natural-language chat with `@alpha`.
-
 ## Hashline Edit Format
 
-Ask Alpha to read a file first, or run `/read path`. It returns an anchor like:
+Ask Alpha to read a file first. It returns an anchor like:
 
 ```text
 ¶src/example.ts#abc123def456
 ```
 
-Then send:
+Then ask Alpha to apply this hashline patch:
 
 ```text
-/edit
 ¶src/example.ts#abc123def456
 replace 10:12
 +new line 1
 +new line 2
 ```
 
-By default, `edit` applies after validating the hash and range. Set `alpha.edit.defaultMode` to `preview` to queue edits and apply them later with `/resolve apply <id>` or the `Alpha: Apply Pending Edit` command.
+By default, `edit` applies after validating the hash and range. Set `alpha.edit.defaultMode` to `preview` to queue edits and apply them later with `resolve` or the `Alpha: Apply Pending Edit` command.
 
 ## Development
 

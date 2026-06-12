@@ -3,7 +3,6 @@ import { applyWorkspaceEdits } from "./patch/hashline";
 import { InMemoryPendingEditStore, InMemoryTodoStore } from "./store";
 import type { AlphaContext } from "./types";
 import { answerWithAlphaTools } from "./lmTools";
-import { toolHelp, tools } from "./tools";
 
 const pendingEdits = new InMemoryPendingEditStore();
 const todos = new InMemoryTodoStore();
@@ -88,20 +87,8 @@ async function handleAlphaRequest(
   };
 
   try {
-    if (!prompt || prompt === "help" || prompt === "/help") {
-      stream.markdown(["Alpha tools:", "", toolHelp(), "", "Ask naturally, e.g. `read src/foo.ts and explain it`. Slash forms like `/read path` remain available as deterministic shortcuts."].join("\n"));
-      return;
-    }
-
-    const explicit = parseExplicitToolCall(prompt);
-    if (explicit) {
-      const tool = tools.find((candidate) => candidate.name === explicit.name);
-      if (!tool) {
-        stream.markdown(`Unknown Alpha tool \`${explicit.name}\`.\n\n${toolHelp()}`);
-        return;
-      }
-      const result = await tool.run(explicit.args, alphaContext);
-      stream.markdown(result.markdown);
+    if (!prompt || prompt === "help") {
+      stream.markdown("Alpha is an OMP-style VS Code chat participant. Ask naturally, e.g. `read src/foo.ts and explain it` or `search for TODO comments`.");
       return;
     }
 
@@ -110,12 +97,4 @@ async function handleAlphaRequest(
     const message = error instanceof Error ? error.message : String(error);
     stream.markdown(`Alpha error: ${message}`);
   }
-}
-
-function parseExplicitToolCall(prompt: string): { name: string; args: string } | undefined {
-  const match = prompt.match(/^\/([a-z_][a-z0-9_]*)\b\s*([\s\S]*)$/i);
-  if (!match) return undefined;
-  const name = match[1].toLowerCase();
-  if (!tools.some((tool) => tool.name === name)) return undefined;
-  return { name, args: match[2] ?? "" };
 }
