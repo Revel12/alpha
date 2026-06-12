@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 export interface AlphaContext {
   extensionContext: vscode.ExtensionContext;
   request: vscode.ChatRequest;
+  chatContext: vscode.ChatContext;
   stream: vscode.ChatResponseStream;
   token: vscode.CancellationToken;
   pendingEdits: PendingEditStore;

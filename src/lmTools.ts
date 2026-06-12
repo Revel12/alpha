@@ -12,10 +12,7 @@ export function toolCallingSystemPrompt(): string {
 
 export async function answerWithAlphaTools(prompt: string, ctx: AlphaContext): Promise<void> {
   const baseSelection = getBaseToolSelection(ctx);
-  const messages: vscode.LanguageModelChatMessage[] = [
-    vscode.LanguageModelChatMessage.User(buildAlphaSystemPrompt(ctx, baseSelection)),
-    vscode.LanguageModelChatMessage.User(prompt),
-  ];
+  const messages = buildInitialMessages(prompt, ctx, baseSelection);
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const pendingResolve = ctx.pendingEdits.list().length > 0;
@@ -67,6 +64,49 @@ export async function answerWithAlphaTools(prompt: string, ctx: AlphaContext): P
   }
 
   ctx.stream.markdown("\n\nAlpha stopped after too many tool-call rounds.");
+}
+
+function buildInitialMessages(prompt: string, ctx: AlphaContext, baseSelection: AlphaToolSelection): vscode.LanguageModelChatMessage[] {
+  const messages: vscode.LanguageModelChatMessage[] = [
+    vscode.LanguageModelChatMessage.User(buildAlphaSystemPrompt(ctx, baseSelection)),
+  ];
+
+  for (const turn of ctx.chatContext.history) {
+    if (isChatRequestTurn(turn)) {
+      messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
+      continue;
+    }
+
+    if (isChatResponseTurn(turn)) {
+      const text = chatResponseTurnText(turn);
+      if (text.trim()) messages.push(vscode.LanguageModelChatMessage.Assistant(text));
+    }
+  }
+
+  messages.push(vscode.LanguageModelChatMessage.User(prompt));
+  return messages;
+}
+
+function chatResponseTurnText(turn: vscode.ChatResponseTurn): string {
+  const parts: string[] = [];
+  for (const part of turn.response) {
+    if (isMarkdownResponsePart(part)) {
+      parts.push(part.value.value);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function isChatRequestTurn(turn: vscode.ChatRequestTurn | vscode.ChatResponseTurn): turn is vscode.ChatRequestTurn {
+  return "prompt" in turn;
+}
+
+function isChatResponseTurn(turn: vscode.ChatRequestTurn | vscode.ChatResponseTurn): turn is vscode.ChatResponseTurn {
+  return "response" in turn;
+}
+
+function isMarkdownResponsePart(part: vscode.ChatResponseTurn["response"][number]): part is vscode.ChatResponseMarkdownPart {
+  return "value" in part && typeof part.value?.value === "string";
 }
 
 function getBaseToolSelection(ctx: AlphaContext): AlphaToolSelection {

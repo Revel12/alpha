@@ -1,20 +1,10 @@
 import * as vscode from "vscode";
 import { applyWorkspaceEdits } from "./patch/hashline";
-import {
-  InMemoryArtifactStore,
-  InMemoryBashJobStore,
-  InMemoryFileSnapshotStore,
-  InMemoryPendingEditStore,
-  InMemoryTodoStore,
-} from "./store";
+import { AlphaSessionManager } from "./sessionState";
 import type { AlphaContext } from "./types";
 import { answerWithAlphaTools } from "./lmTools";
 
-const pendingEdits = new InMemoryPendingEditStore();
-const todos = new InMemoryTodoStore();
-const snapshots = new InMemoryFileSnapshotStore();
-const artifacts = new InMemoryArtifactStore();
-const bashJobs = new InMemoryBashJobStore();
+const sessions = new AlphaSessionManager();
 
 export function activate(context: vscode.ExtensionContext): void {
   const participant = vscode.chat.createChatParticipant("alpha.participant", async (request, chatContext, stream, token) => {
@@ -25,7 +15,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     participant,
     vscode.commands.registerCommand("alpha.openPendingEdits", async () => {
-      const edits = pendingEdits.list();
+      const session = sessions.latest();
+      const edits = session?.pendingEdits.list() ?? [];
       if (!edits.length) {
         void vscode.window.showInformationMessage("Alpha has no pending edits.");
         return;
@@ -44,7 +35,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.commands.registerCommand("alpha.applyPendingEdit", async () => {
-      const edits = pendingEdits.list();
+      const session = sessions.latest();
+      const edits = session?.pendingEdits.list() ?? [];
       if (!edits.length) {
         void vscode.window.showInformationMessage("Alpha has no pending edits.");
         return;
@@ -61,44 +53,43 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!picked) return;
       const ok = await applyWorkspaceEdits(picked.edit.edits);
       if (ok) {
-        pendingEdits.remove(picked.edit.id);
+        session?.pendingEdits.remove(picked.edit.id);
         void vscode.window.showInformationMessage(`Applied ${picked.edit.id}.`);
       } else {
         void vscode.window.showErrorMessage(`VS Code rejected ${picked.edit.id}.`);
       }
     }),
     vscode.commands.registerCommand("alpha.clearPendingEdits", () => {
-      pendingEdits.clear();
+      sessions.latest()?.pendingEdits.clear();
       void vscode.window.showInformationMessage("Cleared Alpha pending edits.");
     }),
   );
 }
 
 export function deactivate(): void {
-  pendingEdits.clear();
-  snapshots.clear();
-  artifacts.clear();
-  bashJobs.clear();
+  sessions.clear();
 }
 
 async function handleAlphaRequest(
   extensionContext: vscode.ExtensionContext,
   request: vscode.ChatRequest,
-  _chatContext: vscode.ChatContext,
+  chatContext: vscode.ChatContext,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
   const prompt = request.prompt.trim();
+  const session = sessions.get(chatContext, request);
   const alphaContext: AlphaContext = {
     extensionContext,
     request,
+    chatContext,
     stream,
     token,
-    pendingEdits,
-    todos,
-    snapshots,
-    artifacts,
-    bashJobs,
+    pendingEdits: session.pendingEdits,
+    todos: session.todos,
+    snapshots: session.snapshots,
+    artifacts: session.artifacts,
+    bashJobs: session.bashJobs,
   };
 
   try {
