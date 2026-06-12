@@ -17,7 +17,10 @@ export const resolveTool: ToolDefinition = {
     const pending = input.extra?.id ? ctx.pendingEdits.get(input.extra.id) : ctx.pendingEdits.list()[0];
 
     if (!pending) {
-      return { markdown: "No pending preview work to resolve." };
+      if (input.action === "discard") {
+        return { markdown: "Nothing to discard; no pending action remains." };
+      }
+      throw new Error("No pending action to resolve. Nothing to apply or discard.");
     }
 
     if (input.action === "discard") {

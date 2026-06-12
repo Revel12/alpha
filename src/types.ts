@@ -7,6 +7,7 @@ export interface AlphaContext {
   token: vscode.CancellationToken;
   pendingEdits: PendingEditStore;
   todos: TodoStore;
+  snapshots: FileSnapshotStore;
 }
 
 export interface ToolResult {
@@ -50,4 +51,18 @@ export interface TodoItem {
 export interface TodoStore {
   list(): TodoItem[];
   set(items: TodoItem[]): void;
+}
+
+export interface FileSnapshot {
+  path: string;
+  tag: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface FileSnapshotStore {
+  record(path: string, content: string): FileSnapshot;
+  get(path: string, tag: string): FileSnapshot | undefined;
+  has(path: string, tag: string): boolean;
+  clear(): void;
 }

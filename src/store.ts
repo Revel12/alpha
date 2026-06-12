@@ -1,4 +1,5 @@
-import type { PendingEdit, PendingEditStore, TodoItem, TodoStore } from "./types";
+import { contentTag } from "./hash";
+import type { FileSnapshot, FileSnapshotStore, PendingEdit, PendingEditStore, TodoItem, TodoStore } from "./types";
 
 export class InMemoryPendingEditStore implements PendingEditStore {
   private edits: PendingEdit[] = [];
@@ -39,5 +40,34 @@ export class InMemoryTodoStore implements TodoStore {
 
   set(items: TodoItem[]): void {
     this.items = [...items];
+  }
+}
+
+export class InMemoryFileSnapshotStore implements FileSnapshotStore {
+  private snapshots = new Map<string, FileSnapshot[]>();
+
+  record(path: string, content: string): FileSnapshot {
+    const snapshot: FileSnapshot = {
+      path,
+      tag: contentTag(content),
+      content,
+      createdAt: new Date().toISOString(),
+    };
+    const existing = this.snapshots.get(path) ?? [];
+    const withoutDuplicate = existing.filter((item) => item.tag !== snapshot.tag);
+    this.snapshots.set(path, [snapshot, ...withoutDuplicate].slice(0, 4));
+    return snapshot;
+  }
+
+  get(path: string, tag: string): FileSnapshot | undefined {
+    return this.snapshots.get(path)?.find((snapshot) => snapshot.tag === tag.toUpperCase());
+  }
+
+  has(path: string, tag: string): boolean {
+    return this.get(path, tag) !== undefined;
+  }
+
+  clear(): void {
+    this.snapshots.clear();
   }
 }

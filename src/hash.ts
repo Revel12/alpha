@@ -19,6 +19,6 @@ export function renderAnchoredFile(path: string, content: string, startLine = 1)
 
 export function renderAnchoredFileWithTag(path: string, content: string, tag: string, startLine = 1): string {
   const lines = content.split(/\r?\n/);
-  const numbered = lines.map((line, index) => `${String(startLine + index).padStart(5, " ")}  ${line}`);
+  const numbered = lines.map((line, index) => `${startLine + index}:${line}`);
   return [`[${path}#${tag}]`, "```text", ...numbered, "```"].join("\n");
 }

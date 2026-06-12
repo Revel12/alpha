@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
 import { applyWorkspaceEdits } from "./patch/hashline";
-import { InMemoryPendingEditStore, InMemoryTodoStore } from "./store";
+import { InMemoryFileSnapshotStore, InMemoryPendingEditStore, InMemoryTodoStore } from "./store";
 import type { AlphaContext } from "./types";
 import { answerWithAlphaTools } from "./lmTools";
 
 const pendingEdits = new InMemoryPendingEditStore();
 const todos = new InMemoryTodoStore();
+const snapshots = new InMemoryFileSnapshotStore();
 
 export function activate(context: vscode.ExtensionContext): void {
   const participant = vscode.chat.createChatParticipant("alpha.participant", async (request, chatContext, stream, token) => {
@@ -67,6 +68,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   pendingEdits.clear();
+  snapshots.clear();
 }
 
 async function handleAlphaRequest(
@@ -84,6 +86,7 @@ async function handleAlphaRequest(
     token,
     pendingEdits,
     todos,
+    snapshots,
   };
 
   try {

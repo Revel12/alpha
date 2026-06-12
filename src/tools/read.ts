@@ -1,27 +1,29 @@
 import * as vscode from "vscode";
-import { contentTag, renderAnchoredFile, renderAnchoredFileWithTag } from "../hash";
-import type { ToolDefinition } from "../types";
+import { renderAnchoredFileWithTag } from "../hash";
+import type { AlphaContext, ToolDefinition } from "../types";
 import { readDirectory, readText, relativePath, resolveWorkspaceFile, stat } from "../workspace";
 
 interface ReadTarget {
   path: string;
   raw: boolean;
-  range?: {
-    startLine: number;
-    endLine: number;
-  };
+  ranges?: ReadRange[];
+}
+
+interface ReadRange {
+  startLine: number;
+  endLine?: number;
 }
 
 export const readTool: ToolDefinition = {
   name: "read",
   summary: "Read a workspace file, directory, active editor, or selection and return hash-anchored text.",
-  async run(args) {
+  async run(args, ctx) {
     const config = vscode.workspace.getConfiguration("alpha");
     const maxBytes = config.get<number>("read.maxBytes", 200000);
     const target = parseReadTarget(args.trim() || "active");
 
     if (target.path === "active" || target.path === "selection" || target.path === "active:selection") {
-      return readActiveEditor(target);
+      return readActiveEditor(target, ctx);
     }
 
     const uri = await resolveWorkspaceFile(target.path);
@@ -32,43 +34,47 @@ export const readTool: ToolDefinition = {
     }
 
     const content = await readText(uri, maxBytes);
-    if (target.raw) return { markdown: content };
+    if (target.raw) return { markdown: renderRawContent(content, target.ranges) };
 
-    return { markdown: renderContent(relativePath(uri), content, target.range) };
+    const path = relativePath(uri);
+    const snapshot = ctx.snapshots.record(path, content);
+    return { markdown: renderContent(path, content, snapshot.tag, target.ranges) };
   },
 };
 
-function parseReadTarget(input: string): ReadTarget {
-  let path = input.trim();
+export function parseReadTarget(input: string): ReadTarget {
+  let rest = input.trim();
   let raw = false;
 
-  if (path.endsWith(":raw")) {
+  if (rest.endsWith(":raw")) {
     raw = true;
-    path = path.slice(0, -4);
+    rest = rest.slice(0, -4);
   }
 
-  const rangeMatch = path.match(/:(\d+)(?:(?:-|\.\.)(\d+)|\+(\d+))?$/);
-  if (!rangeMatch) return { path, raw };
+  const rangeSuffix = rest.match(/:((?:[Ll]?\d+(?:(?:-|\.\.)[Ll]?\d*|\+[Ll]?\d+)?)(?:,[Ll]?\d+(?:(?:-|\.\.)[Ll]?\d*|\+[Ll]?\d+)?)*)$/);
+  if (rangeSuffix) {
+    rest = rest.slice(0, rangeSuffix.index ?? rest.length);
+  }
 
-  const startLine = Number(rangeMatch[1]);
-  const explicitEnd = rangeMatch[2] ? Number(rangeMatch[2]) : undefined;
-  const count = rangeMatch[3] ? Number(rangeMatch[3]) : undefined;
-  const endLine = explicitEnd ?? (count ? startLine + count - 1 : startLine);
+  if (rest.endsWith(":raw")) {
+    raw = true;
+    rest = rest.slice(0, -4);
+  }
 
   return {
-    path: path.slice(0, rangeMatch.index),
+    path: rest,
     raw,
-    range: { startLine, endLine },
+    ranges: rangeSuffix ? parseRanges(rangeSuffix[1]) : undefined,
   };
 }
 
-async function readActiveEditor(target: ReadTarget): Promise<{ markdown: string }> {
+async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<{ markdown: string }> {
   const editor = vscode.window.activeTextEditor;
   if (!editor) throw new Error("No active editor.");
 
   const fullText = editor.document.getText();
   const path = relativePath(editor.document.uri);
-  const tag = contentTag(fullText);
+  const tag = ctx.snapshots.record(path, fullText).tag;
 
   if (target.path === "selection" || target.path === "active:selection") {
     if (editor.selection.isEmpty) throw new Error("No active selection.");
@@ -77,9 +83,9 @@ async function readActiveEditor(target: ReadTarget): Promise<{ markdown: string 
     return { markdown: renderAnchoredFileWithTag(path, content, tag, startLine) };
   }
 
-  if (target.raw) return { markdown: fullText };
+  if (target.raw) return { markdown: renderRawContent(fullText, target.ranges) };
 
-  return { markdown: renderContent(path, fullText, target.range) };
+  return { markdown: renderContent(path, fullText, tag, target.ranges) };
 }
 
 async function renderDirectory(uri: vscode.Uri): Promise<string> {
@@ -92,12 +98,89 @@ async function renderDirectory(uri: vscode.Uri): Promise<string> {
   return [`[${path}/]`, "```text", ...lines, "```"].join("\n");
 }
 
-function renderContent(path: string, content: string, range?: ReadTarget["range"]): string {
-  if (!range) return renderAnchoredFile(path, content);
+function renderContent(path: string, content: string, tag: string, ranges?: ReadRange[]): string {
+  if (!ranges?.length) return renderAnchoredFileWithTag(path, content, tag);
 
   const lines = content.split(/\r?\n/);
-  const start = Math.max(1, range.startLine);
-  const end = Math.max(start, Math.min(lines.length, range.endLine));
-  const excerpt = lines.slice(start - 1, end).join("\n");
-  return renderAnchoredFileWithTag(path, excerpt, contentTag(content), start);
+  const selected: string[] = [];
+  for (const range of ranges) {
+    const start = range.startLine;
+    const end = Math.min(lines.length, range.endLine ?? lines.length);
+    for (let line = start; line <= end; line++) {
+      selected.push(`${line}:${lines[line - 1] ?? ""}`);
+    }
+  }
+  return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+}
+
+function renderRawContent(content: string, ranges?: ReadRange[]): string {
+  if (!ranges?.length) return content;
+
+  const lines = content.split(/\r?\n/);
+  const selected: string[] = [];
+  for (const range of ranges) {
+    const end = Math.min(lines.length, range.endLine ?? lines.length);
+    for (let line = range.startLine; line <= end; line++) {
+      selected.push(lines[line - 1] ?? "");
+    }
+  }
+  return selected.join("\n");
+}
+
+function parseRanges(input: string): ReadRange[] {
+  return mergeRanges(input.split(",").map(parseRange));
+}
+
+function parseRange(input: string): ReadRange {
+  const chunk = input.replace(/l/gi, "");
+  const count = chunk.match(/^(\d+)\+(\d+)$/);
+  if (count) {
+    const startLine = positiveLine(count[1]);
+    const lineCount = positiveLine(count[2]);
+    return { startLine, endLine: startLine + lineCount - 1 };
+  }
+
+  const bounded = chunk.match(/^(\d+)(?:-|\.\.)(\d*)$/);
+  if (bounded) {
+    const startLine = positiveLine(bounded[1]);
+    const endLine = bounded[2] ? positiveLine(bounded[2]) : undefined;
+    if (endLine !== undefined && endLine < startLine) {
+      throw new Error(`Invalid line range ${input}; end must be >= start.`);
+    }
+    return { startLine, endLine };
+  }
+
+  const single = chunk.match(/^(\d+)$/);
+  if (single) {
+    const startLine = positiveLine(single[1]);
+    return { startLine, endLine: startLine };
+  }
+
+  throw new Error(`Invalid read selector: ${input}`);
+}
+
+function positiveLine(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error("Line selectors are 1-indexed; use :1 or higher.");
+  }
+  return parsed;
+}
+
+function mergeRanges(ranges: ReadRange[]): ReadRange[] {
+  const sorted = [...ranges].sort((left, right) => left.startLine - right.startLine);
+  const merged: ReadRange[] = [];
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous) {
+      merged.push({ ...range });
+      continue;
+    }
+    if (previous.endLine === undefined || range.startLine > previous.endLine + 1) {
+      merged.push({ ...range });
+      continue;
+    }
+    previous.endLine = range.endLine === undefined ? undefined : Math.max(previous.endLine, range.endLine);
+  }
+  return merged;
 }
