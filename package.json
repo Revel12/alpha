@@ -1,0 +1,81 @@
+{
+  "name": "alpha",
+  "displayName": "Alpha",
+  "description": "OMP-style local harness as a VS Code chat participant using VS Code/Copilot model access.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onChatParticipant:alpha.participant",
+    "onCommand:alpha.openPendingEdits",
+    "onCommand:alpha.applyPendingEdit",
+    "onCommand:alpha.clearPendingEdits"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "alpha.participant",
+        "name": "alpha",
+        "fullName": "Alpha",
+        "description": "OMP-style local coding harness with read/search/edit/todo/review tools."
+      }
+    ],
+    "commands": [
+      {
+        "command": "alpha.openPendingEdits",
+        "title": "Alpha: Open Pending Edits"
+      },
+      {
+        "command": "alpha.applyPendingEdit",
+        "title": "Alpha: Apply Pending Edit"
+      },
+      {
+        "command": "alpha.clearPendingEdits",
+        "title": "Alpha: Clear Pending Edits"
+      }
+    ],
+    "configuration": {
+      "title": "Alpha",
+      "properties": {
+        "alpha.edit.defaultMode": {
+          "type": "string",
+          "enum": [
+            "apply",
+            "preview"
+          ],
+          "default": "apply",
+          "description": "Default edit behavior. apply matches OMP-style edits; preview queues edits for explicit resolve."
+        },
+        "alpha.search.maxResults": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum search matches returned by the local search tool."
+        },
+        "alpha.read.maxBytes": {
+          "type": "number",
+          "default": 200000,
+          "minimum": 1000,
+          "description": "Maximum bytes read from a single file."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.6.0"
+  }
+}
