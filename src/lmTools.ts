@@ -106,7 +106,8 @@ function isChatResponseTurn(turn: vscode.ChatRequestTurn | vscode.ChatResponseTu
 }
 
 function isMarkdownResponsePart(part: vscode.ChatResponseTurn["response"][number]): part is vscode.ChatResponseMarkdownPart {
-  return "value" in part && typeof part.value?.value === "string";
+  const candidate = part as { value?: { value?: unknown } };
+  return typeof candidate.value?.value === "string";
 }
 
 function getBaseToolSelection(ctx: AlphaContext): AlphaToolSelection {
