@@ -15,7 +15,7 @@ import { InMemoryFileSnapshotStore } from "../out/store.js";
 test("public tools are advertised by default", () => {
   const names = getAdvertisedAlphaLanguageModelTools().map((tool) => tool.name);
 
-  assert.deepEqual(names, ["read", "search", "find", "diff", "edit", "write", "todo"]);
+  assert.deepEqual(names, ["read", "bash", "search", "find", "edit", "write", "todo"]);
 });
 
 test("hidden tools are registered but not advertised by default", () => {
@@ -38,15 +38,15 @@ test("hidden tools can be selected as the only forced workflow tool", () => {
 });
 
 test("essential-only selection follows OMP-style load modes", () => {
-  assert.deepEqual(DEFAULT_ESSENTIAL_TOOL_NAMES, ["read", "edit"]);
-  assert.deepEqual(getEssentialAlphaToolNames(), ["read", "edit"]);
+  assert.deepEqual(DEFAULT_ESSENTIAL_TOOL_NAMES, ["read", "bash", "edit"]);
+  assert.deepEqual(getEssentialAlphaToolNames(), ["read", "bash", "edit"]);
 
   const advertisedNames = getAdvertisedAlphaLanguageModelTools({ includeDiscoverable: false }).map((tool) => tool.name);
-  assert.deepEqual(advertisedNames, ["read", "edit"]);
+  assert.deepEqual(advertisedNames, ["read", "bash", "edit"]);
 });
 
 test("discoverable public tools are classified separately from essentials", () => {
-  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "diff", "write", "todo"]);
+  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "write", "todo"]);
 });
 
 test("registry names are unique", () => {
@@ -68,6 +68,16 @@ test("edit uses the OMP-style input field", () => {
   assert.equal(edit.inputSchema.properties.input.type, "string");
 });
 
+test("bash uses the OMP-style command contract", () => {
+  const bash = getAlphaToolRegistration("bash");
+
+  assert.equal(bash.loadMode, "essential");
+  assert.deepEqual(bash.inputSchema.required, ["command"]);
+  assert.equal(bash.inputSchema.properties.command.type, "string");
+  assert.equal(bash.inputSchema.properties.cwd.type, "string");
+  assert.equal(bash.inputSchema.properties.timeout.type, "number");
+});
+
 test("resolve uses the hidden OMP-style action contract", () => {
   const resolve = getAlphaToolRegistration("resolve");
 
@@ -87,6 +97,7 @@ test("system prompt includes OMP-style tool priority", () => {
   const prompt = buildAlphaSystemPrompt();
 
   assert.match(prompt, /# Tool Priority/);
+  assert.match(prompt, /terminal work.*`bash`/);
   assert.match(prompt, /surgical existing-file edits -> `edit`, not `write`/);
   assert.match(prompt, /file\/dir reads -> `read`/);
 });

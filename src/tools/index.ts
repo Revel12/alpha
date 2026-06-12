@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "../types";
-import { diffTool } from "./diff";
+import { bashTool } from "./bash";
 import { editTool } from "./edit";
 import { findTool } from "./find";
 import { readTool } from "./read";
@@ -11,9 +11,9 @@ import { writeTool } from "./write";
 
 export const tools: ToolDefinition[] = [
   readTool,
+  bashTool,
   searchTool,
   findTool,
-  diffTool,
   editTool,
   writeTool,
   resolveTool,

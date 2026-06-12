@@ -1,11 +1,13 @@
 import * as vscode from "vscode";
 import { renderAnchoredFileWithTag } from "../hash";
 import type { AlphaContext, ToolDefinition } from "../types";
-import { readDirectory, readText, relativePath, resolveWorkspaceFile, stat } from "../workspace";
+import { readDirectory, readText, relativePath, resolveExistingWorkspacePath, stat } from "../workspace";
 
 interface ReadTarget {
   path: string;
   raw: boolean;
+  conflicts: boolean;
+  explicitSelector: boolean;
   ranges?: ReadRange[];
 }
 
@@ -20,13 +22,14 @@ export const readTool: ToolDefinition = {
   async run(args, ctx) {
     const config = vscode.workspace.getConfiguration("alpha");
     const maxBytes = config.get<number>("read.maxBytes", 200000);
+    const defaultLimit = Math.max(1, Math.min(config.get<number>("read.defaultLimit", 200), 2000));
     const target = parseReadTarget(args.trim() || "active");
 
     if (target.path === "active" || target.path === "selection" || target.path === "active:selection") {
       return readActiveEditor(target, ctx);
     }
 
-    const uri = await resolveWorkspaceFile(target.path);
+    const uri = await resolveExistingWorkspacePath(target.path);
     const fileStat = await stat(uri);
 
     if (fileStat.type === vscode.FileType.Directory) {
@@ -38,32 +41,46 @@ export const readTool: ToolDefinition = {
 
     const path = relativePath(uri);
     const snapshot = ctx.snapshots.record(path, content);
-    return { markdown: renderContent(path, content, snapshot.tag, target.ranges) };
+    if (target.conflicts) return { markdown: renderConflicts(path, content, snapshot.tag) };
+    return { markdown: renderContent(path, content, snapshot.tag, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
   },
 };
 
 export function parseReadTarget(input: string): ReadTarget {
   let rest = input.trim();
   let raw = false;
+  let conflicts = false;
+  let explicitSelector = false;
+
+  if (rest.endsWith(":conflicts")) {
+    conflicts = true;
+    explicitSelector = true;
+    rest = rest.slice(0, -10);
+  }
 
   if (rest.endsWith(":raw")) {
     raw = true;
+    explicitSelector = true;
     rest = rest.slice(0, -4);
   }
 
   const rangeSuffix = rest.match(/:((?:[Ll]?\d+(?:(?:-|\.\.)[Ll]?\d*|\+[Ll]?\d+)?)(?:,[Ll]?\d+(?:(?:-|\.\.)[Ll]?\d*|\+[Ll]?\d+)?)*)$/);
   if (rangeSuffix) {
+    explicitSelector = true;
     rest = rest.slice(0, rangeSuffix.index ?? rest.length);
   }
 
   if (rest.endsWith(":raw")) {
     raw = true;
+    explicitSelector = true;
     rest = rest.slice(0, -4);
   }
 
   return {
     path: rest,
     raw,
+    conflicts,
+    explicitSelector,
     ranges: rangeSuffix ? parseRanges(rangeSuffix[1]) : undefined,
   };
 }
@@ -83,23 +100,52 @@ async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<
     return { markdown: renderAnchoredFileWithTag(path, content, tag, startLine) };
   }
 
+  if (target.conflicts) return { markdown: renderConflicts(path, fullText, tag) };
   if (target.raw) return { markdown: renderRawContent(fullText, target.ranges) };
 
-  return { markdown: renderContent(path, fullText, tag, target.ranges) };
+  return { markdown: renderContent(path, fullText, tag, target.ranges, target.explicitSelector ? undefined : 200) };
 }
 
 async function renderDirectory(uri: vscode.Uri): Promise<string> {
-  const entries = await readDirectory(uri);
   const path = relativePath(uri);
-  const lines = entries
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([name, type]) => `${type === vscode.FileType.Directory ? "dir " : "file"}  ${name}`);
+  const lines = await renderDirectoryTree(uri, 0, 2, 400);
 
   return [`[${path}/]`, "```text", ...lines, "```"].join("\n");
 }
 
-function renderContent(path: string, content: string, tag: string, ranges?: ReadRange[]): string {
-  if (!ranges?.length) return renderAnchoredFileWithTag(path, content, tag);
+async function renderDirectoryTree(uri: vscode.Uri, depth: number, maxDepth: number, maxEntries: number): Promise<string[]> {
+  if (maxEntries <= 0) return ["...[truncated]"];
+
+  const entries = (await readDirectory(uri)).sort(([left], [right]) => left.localeCompare(right));
+  const lines: string[] = [];
+  for (const [name, type] of entries) {
+    if (lines.length >= maxEntries) {
+      lines.push("...[truncated]");
+      break;
+    }
+
+    const prefix = "  ".repeat(depth);
+    const isDirectory = type === vscode.FileType.Directory;
+    lines.push(`${prefix}${isDirectory ? "dir " : "file"}  ${name}${isDirectory ? "/" : ""}`);
+    if (isDirectory && depth + 1 < maxDepth) {
+      const child = vscode.Uri.joinPath(uri, name);
+      const childLines = await renderDirectoryTree(child, depth + 1, maxDepth, maxEntries - lines.length);
+      lines.push(...childLines);
+    }
+  }
+  return lines;
+}
+
+function renderContent(path: string, content: string, tag: string, ranges?: ReadRange[], defaultLimit?: number): string {
+  if (!ranges?.length) {
+    const lines = content.split(/\r?\n/);
+    if (defaultLimit && lines.length > defaultLimit) {
+      const selected = lines.slice(0, defaultLimit).map((line, index) => `${index + 1}:${line}`);
+      selected.push(`[${lines.length - defaultLimit} lines elided; re-read needed ranges, e.g. ${path}:${defaultLimit + 1}-${Math.min(lines.length, defaultLimit + 80)}]`);
+      return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+    }
+    return renderAnchoredFileWithTag(path, content, tag);
+  }
 
   const lines = content.split(/\r?\n/);
   const selected: string[] = [];
@@ -125,6 +171,31 @@ function renderRawContent(content: string, ranges?: ReadRange[]): string {
     }
   }
   return selected.join("\n");
+}
+
+function renderConflicts(path: string, content: string, tag: string): string {
+  const lines = content.split(/\r?\n/);
+  const selected: string[] = [];
+  let inConflict = false;
+  let start = 0;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.startsWith("<<<<<<<")) {
+      inConflict = true;
+      start = Math.max(0, index - 2);
+    }
+    if (inConflict && line.startsWith(">>>>>>>")) {
+      const end = Math.min(lines.length - 1, index + 2);
+      for (let lineIndex = start; lineIndex <= end; lineIndex++) {
+        selected.push(`${lineIndex + 1}:${lines[lineIndex] ?? ""}`);
+      }
+      inConflict = false;
+    }
+  }
+
+  if (!selected.length) return `[${path}#${tag}]\nNo conflict markers found.`;
+  return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
 }
 
 function parseRanges(input: string): ReadRange[] {

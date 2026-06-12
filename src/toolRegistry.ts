@@ -24,7 +24,7 @@ export interface AlphaToolSelection {
   ctx?: AlphaContext;
 }
 
-export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "edit"] as const;
+export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "bash", "edit"] as const;
 
 const stringProperty = (description: string): object => ({ type: "string", description });
 const alwaysEnabled = (): boolean => true;
@@ -39,6 +39,25 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     enabled: alwaysEnabled,
     loadTool: async () => (await import("./tools/read.js")).readTool,
     toArgs: (input) => optionalString(input, "path") || "active",
+  },
+  {
+    name: "bash",
+    visibility: "public",
+    loadMode: "essential",
+    description: "Execute a shell command for build, test, git, package-manager, and other terminal operations. Do not use for file reading, searching, listing, or routine edits.",
+    inputSchema: objectSchema(
+      {
+        command: stringProperty("Shell command to execute."),
+        env: { type: "object", additionalProperties: { type: "string" }, description: "Extra environment variables." },
+        timeout: { type: "number", description: "Timeout in seconds. Default 300; allowed range 1-3600." },
+        cwd: stringProperty("Workspace-relative working directory."),
+        pty: { type: "boolean", description: "Accepted for OMP schema compatibility; Alpha runs non-PTY commands." },
+      },
+      ["command"],
+    ),
+    enabled: alwaysEnabled,
+    loadTool: async () => (await import("./tools/bash.js")).bashTool,
+    toArgs: (input) => JSON.stringify(input),
   },
   {
     name: "search",
@@ -61,16 +80,6 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     toArgs: (input) => optionalString(input, "glob") || "**/*",
   },
   {
-    name: "diff",
-    visibility: "public",
-    loadMode: "discoverable",
-    description: "Show changed files and git diff stats for the workspace.",
-    inputSchema: objectSchema({}, []),
-    enabled: alwaysEnabled,
-    loadTool: async () => (await import("./tools/diff.js")).diffTool,
-    toArgs: () => "",
-  },
-  {
     name: "edit",
     visibility: "public",
     loadMode: "essential",
@@ -89,12 +98,14 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
       {
         path: stringProperty("Workspace-relative file path to write."),
         content: stringProperty("Complete file content to write."),
+        overwriteGenerated: { type: "boolean", description: "Allow overwriting generated, lock, build, or vendor files." },
+        createDocumentation: { type: "boolean", description: "Allow creating documentation files such as README or Markdown files." },
       },
       ["path", "content"],
     ),
     enabled: alwaysEnabled,
     loadTool: async () => (await import("./tools/write.js")).writeTool,
-    toArgs: (input) => `${requiredString(input, "path")}\n${requiredString(input, "content")}`,
+    toArgs: (input) => JSON.stringify(input),
   },
   {
     name: "resolve",

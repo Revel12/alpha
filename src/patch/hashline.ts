@@ -11,6 +11,7 @@ interface ParsedHashlineEdit {
   operation: HashlineOperation;
   startLine: number;
   endLine: number;
+  block?: boolean;
   insertSide?: "before" | "after";
   newText: string;
   sourceLine: number;
@@ -82,6 +83,7 @@ export function parseHashlineEdits(input: string): ParsedHashlineEdit[] {
       operation: command.operation,
       startLine: command.startLine,
       endLine: command.endLine,
+      block: command.block,
       insertSide: command.insertSide,
       newText: body.length ? body.join("\n") + "\n" : "",
       sourceLine: commandLine,
@@ -99,6 +101,7 @@ export async function buildWorkspaceEdits(input: string, maxBytes: number, snaps
   }
 
   const edits: WorkspaceTextEdit[] = [];
+  const resolvedLineTargets = new Map<string, number>();
   for (const item of parsed) {
     const uri = await resolveWorkspaceFile(item.path);
     const snapshotPath = relativePath(uri);
@@ -116,10 +119,12 @@ export async function buildWorkspaceEdits(input: string, maxBytes: number, snaps
     }
 
     const document = await vscode.workspace.openTextDocument(uri);
+    const resolved = resolveBlockEdit(document, item);
+    assertResolvedNoOverlap(snapshotPath, resolved, resolvedLineTargets);
     edits.push({
       uri,
-      range: editRange(document, item),
-      newText: item.newText,
+      range: editRange(document, resolved),
+      newText: resolved.newText,
     });
   }
   return edits;
@@ -142,12 +147,24 @@ function parseHeader(line: string): { path: string; expectedTag?: string } | und
 
 function parseCommand(
   line: string,
-): { operation: HashlineOperation; startLine: number; endLine: number; insertSide?: "before" | "after" } | undefined {
+): { operation: HashlineOperation; startLine: number; endLine: number; block?: boolean; insertSide?: "before" | "after" } | undefined {
+  const replaceBlock = line.match(/^replace\s+block\s+(\d+):?\s*$/i);
+  if (replaceBlock) {
+    const lineNumber = Number(replaceBlock[1]);
+    return { operation: "replace", startLine: lineNumber, endLine: lineNumber, block: true };
+  }
+
   const replace = line.match(/^replace\s+(\d+)(?:(?:\.\.|:|-)(\d+))?:?\s*$/i);
   if (replace) {
     const startLine = Number(replace[1]);
     const endLine = Number(replace[2] ?? replace[1]);
     return { operation: "replace", startLine, endLine };
+  }
+
+  const deleteBlock = line.match(/^delete\s+block\s+(\d+)\s*$/i);
+  if (deleteBlock) {
+    const lineNumber = Number(deleteBlock[1]);
+    return { operation: "delete", startLine: lineNumber, endLine: lineNumber, block: true };
   }
 
   const deleteMatch = line.match(/^delete\s+(\d+)(?:(?:\.\.|:|-)(\d+))?\s*$/i);
@@ -164,6 +181,12 @@ function parseCommand(
     return { operation: "insert", startLine: lineNumber, endLine: lineNumber, insertSide: side };
   }
 
+  const insertAfterBlock = line.match(/^insert\s+after\s+block\s+(\d+):?\s*$/i);
+  if (insertAfterBlock) {
+    const lineNumber = Number(insertAfterBlock[1]);
+    return { operation: "insert", startLine: lineNumber, endLine: lineNumber, block: true, insertSide: "after" };
+  }
+
   const head = line.match(/^insert\s+head:?\s*$/i);
   if (head) return { operation: "insert", startLine: 1, endLine: 1, insertSide: "before" };
 
@@ -175,12 +198,82 @@ function parseCommand(
 
 function editRange(document: vscode.TextDocument, edit: ParsedHashlineEdit): vscode.Range {
   if (edit.operation === "insert") {
-    const targetLine = Math.min(edit.startLine, document.lineCount);
+    const targetLine = Math.min(edit.block && edit.insertSide === "after" ? edit.endLine : edit.startLine, document.lineCount);
     const position = insertionPosition(document, targetLine, edit.insertSide ?? "before");
     return new vscode.Range(position, position);
   }
 
   return lineRange(document, edit.startLine, edit.endLine);
+}
+
+function resolveBlockEdit(document: vscode.TextDocument, edit: ParsedHashlineEdit): ParsedHashlineEdit {
+  if (!edit.block) return edit;
+  const blockEndLine = findBlockEndLine(document, edit.startLine);
+  return { ...edit, endLine: blockEndLine };
+}
+
+function findBlockEndLine(document: vscode.TextDocument, startLineOneBased: number): number {
+  if (startLineOneBased < 1 || startLineOneBased > document.lineCount) {
+    throw new Error(`Invalid block line ${startLineOneBased} for ${document.lineCount} line document.`);
+  }
+
+  const startIndex = startLineOneBased - 1;
+  const startText = document.lineAt(startIndex).text;
+  if (/^\s*[}\])]/.test(startText)) {
+    throw new Error(`Invalid block anchor line ${startLineOneBased}; block anchors must point at the opener, not a closing delimiter.`);
+  }
+
+  const braceEnd = findBraceBlockEndLine(document, startIndex);
+  if (braceEnd !== undefined) return braceEnd;
+
+  const startIndent = leadingWhitespace(startText).length;
+  let last = startLineOneBased;
+  for (let index = startIndex + 1; index < document.lineCount; index++) {
+    const text = document.lineAt(index).text;
+    if (!text.trim()) {
+      last = index + 1;
+      continue;
+    }
+    if (leadingWhitespace(text).length <= startIndent) break;
+    last = index + 1;
+  }
+  return last;
+}
+
+function assertResolvedNoOverlap(path: string, edit: ParsedHashlineEdit, seen: Map<string, number>): void {
+  if (edit.operation === "insert") return;
+  for (let line = edit.startLine; line <= edit.endLine; line++) {
+    const key = `${path}:${line}`;
+    const previous = seen.get(key);
+    if (previous !== undefined) {
+      throw new Error(`line ${edit.sourceLine}: resolved anchor line ${line} is already targeted by another hunk on line ${previous}.`);
+    }
+    seen.set(key, edit.sourceLine);
+  }
+}
+
+function findBraceBlockEndLine(document: vscode.TextDocument, startIndex: number): number | undefined {
+  let depth = 0;
+  let sawOpen = false;
+
+  for (let index = startIndex; index < document.lineCount; index++) {
+    const text = document.lineAt(index).text;
+    for (const char of text) {
+      if (char === "{") {
+        depth++;
+        sawOpen = true;
+      } else if (char === "}") {
+        depth--;
+        if (sawOpen && depth <= 0) return index + 1;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function leadingWhitespace(text: string): string {
+  return text.match(/^\s*/)?.[0] ?? "";
 }
 
 function assertNoOverlaps(edits: ParsedHashlineEdit[]): void {

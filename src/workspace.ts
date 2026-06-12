@@ -23,6 +23,12 @@ export async function resolveWorkspaceFile(input: string): Promise<vscode.Uri> {
     throw new Error("Expected a workspace-relative path.");
   }
 
+  if (trimmed.startsWith("file://")) {
+    const uri = vscode.Uri.parse(trimmed);
+    ensureInsideWorkspace(uri);
+    return uri;
+  }
+
   if (path.isAbsolute(trimmed)) {
     const uri = vscode.Uri.file(trimmed);
     ensureInsideWorkspace(uri);
@@ -31,6 +37,32 @@ export async function resolveWorkspaceFile(input: string): Promise<vscode.Uri> {
 
   const uri = vscode.Uri.joinPath(workspaceRoot(), trimmed);
   ensureInsideWorkspace(uri);
+  return uri;
+}
+
+export async function resolveExistingWorkspacePath(input: string): Promise<vscode.Uri> {
+  const direct = await resolveWorkspaceFile(input);
+  try {
+    await stat(direct);
+    return direct;
+  } catch {
+    const suffix = normalizeWorkspaceSuffix(input);
+    const matches = await vscode.workspace.findFiles(`**/${path.basename(suffix)}`, "{**/node_modules/**,**/.git/**}", 200);
+    const suffixMatches = matches.filter((uri) => normalizeWorkspaceSuffix(relativePath(uri)).endsWith(suffix));
+    if (suffixMatches.length === 1) return suffixMatches[0];
+    if (suffixMatches.length > 1) {
+      throw new Error(`Ambiguous path suffix ${input}; matches: ${suffixMatches.map(relativePath).sort().join(", ")}`);
+    }
+    throw new Error(`Path not found: ${input}`);
+  }
+}
+
+export async function resolveWorkspaceDirectory(input: string): Promise<vscode.Uri> {
+  const uri = await resolveExistingWorkspacePath(input);
+  const fileStat = await stat(uri);
+  if (fileStat.type !== vscode.FileType.Directory) {
+    throw new Error(`Expected a workspace directory: ${relativePath(uri)}`);
+  }
   return uri;
 }
 
@@ -119,4 +151,13 @@ function truncateText(text: string, maxBytes: number): string {
   const bytes = Buffer.from(text, "utf8");
   if (bytes.byteLength <= maxBytes) return text;
   return Buffer.from(bytes.subarray(0, maxBytes)).toString("utf8") + "\n...[truncated]";
+}
+
+function normalizeWorkspaceSuffix(input: string): string {
+  let value = input.trim();
+  if (value.startsWith("file://")) {
+    value = vscode.workspace.asRelativePath(vscode.Uri.parse(value), false);
+  }
+  value = value.replace(/\\/g, "/").replace(/^\.?\//, "");
+  return value;
 }
