@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import { ensureToolPermission } from "../approval";
+import { editApproval, editApprovalDetails } from "../approvalCore";
 import { applyWorkspaceEdits, buildWorkspaceEdits } from "../patch/hashline";
 import type { ToolDefinition } from "../types";
 import { readOpenDocumentText, relativePath } from "../workspace";
@@ -7,6 +9,12 @@ export const editTool: ToolDefinition = {
   name: "edit",
   summary: "Apply OMP-style hashline edits directly after validating snapshot tags and ranges.",
   async run(args, ctx) {
+    await ensureToolPermission(
+      { name: "edit", approval: editApproval, formatApprovalDetails: editApprovalDetails },
+      { input: args },
+      ctx,
+    );
+
     const config = vscode.workspace.getConfiguration("alpha");
     const maxBytes = config.get<number>("read.maxBytes", 200000);
     const edits = await buildWorkspaceEdits(args, maxBytes, ctx.snapshots);

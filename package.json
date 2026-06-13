@@ -15,16 +15,17 @@
     "onChatParticipant:alpha.participant",
     "onCommand:alpha.openPendingEdits",
     "onCommand:alpha.applyPendingEdit",
-    "onCommand:alpha.clearPendingEdits"
+    "onCommand:alpha.clearPendingEdits",
+    "onCommand:alpha.inspectVsCodeTools"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "chatParticipants": [
       {
         "id": "alpha.participant",
-        "name": "alpha",
+        "name": "a",
         "fullName": "Alpha",
-        "description": "OMP-style local coding harness with read/bash/edit/search/find/write/todo tools."
+        "description": "OMP-style local coding harness with read/bash/edit/search/find/write/lsp/bitbucket/task/eval/todo tools."
       }
     ],
     "commands": [
@@ -39,6 +40,10 @@
       {
         "command": "alpha.clearPendingEdits",
         "title": "Alpha: Clear Pending Edits"
+      },
+      {
+        "command": "alpha.inspectVsCodeTools",
+        "title": "Alpha: Inspect VS Code LM Tools"
       }
     ],
     "configuration": {
@@ -48,8 +53,40 @@
           "type": "number",
           "default": 80,
           "minimum": 1,
-          "maximum": 500,
+          "maximum": 5000,
           "description": "Maximum search matches returned by the local search tool."
+        },
+        "alpha.search.contextBefore": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Default context lines emitted before each search match."
+        },
+        "alpha.search.contextAfter": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Default context lines emitted after each search match."
+        },
+        "alpha.search.maxVisibleBytes": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "description": "Maximum visible bytes returned by search before full output is stored as an artifact."
+        },
+        "alpha.search.maxFiles": {
+          "type": "number",
+          "default": 4000,
+          "minimum": 1,
+          "description": "Maximum workspace files considered by the local search tool."
+        },
+        "alpha.find.maxVisibleBytes": {
+          "type": "number",
+          "default": 50000,
+          "minimum": 1000,
+          "description": "Maximum visible bytes returned by find before full output is stored as an artifact."
         },
         "alpha.read.maxBytes": {
           "type": "number",
@@ -80,6 +117,30 @@
           "default": true,
           "description": "Strip trailing head/tail pipes because Alpha stores full output artifacts."
         },
+        "alpha.write.formatOnWrite": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run VS Code document formatting after write when a formatter is available."
+        },
+        "alpha.write.diagnosticsOnWrite": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include VS Code diagnostics for a file after write."
+        },
+        "alpha.session.maxHistoryTurns": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 200,
+          "description": "Maximum prior VS Code chat turns replayed into an Alpha model request."
+        },
+        "alpha.session.retentionDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 365,
+          "description": "Automatically prune persisted Alpha sessions that have not been touched for this many days."
+        },
         "alpha.tools.discoveryMode": {
           "type": "string",
           "enum": [
@@ -88,6 +149,88 @@
           ],
           "default": "off",
           "description": "Tool discovery mode. off advertises all enabled Alpha public tools. all advertises only essential tools; search_tool_bm25 support will activate discoverable tools in a later phase."
+        },
+        "alpha.tools.approvalMode": {
+          "type": "string",
+          "enum": [
+            "always-ask",
+            "write",
+            "yolo"
+          ],
+          "default": "yolo",
+          "description": "OMP-style approval mode. always-ask allows read tier and prompts for write/exec; write allows read/write and prompts for exec; yolo allows all unless per-tool policy overrides."
+        },
+        "alpha.tools.approval": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny",
+              "prompt"
+            ]
+          },
+          "description": "Per-tool OMP-style approval policy overrides, keyed by tool name, with values allow, deny, or prompt."
+        },
+        "alpha.bitbucket.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Bitbucket Server/Data Center base URL. If empty, Alpha infers from git remote origin or uses Bitbucket Cloud."
+        },
+        "alpha.bitbucket.tokenEnv": {
+          "type": "string",
+          "default": "BITBUCKET_TOKEN",
+          "description": "Environment variable containing a Bitbucket bearer token or app password."
+        },
+        "alpha.bitbucket.usernameEnv": {
+          "type": "string",
+          "default": "BITBUCKET_USERNAME",
+          "description": "Environment variable containing a Bitbucket username for basic auth."
+        },
+        "alpha.bitbucket.passwordEnv": {
+          "type": "string",
+          "default": "BITBUCKET_PASSWORD",
+          "description": "Environment variable containing a Bitbucket password or app password for basic auth."
+        },
+        "alpha.task.batch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use OMP-style batch task shape with context and tasks[]. Runtime still accepts legacy flat assignment calls for stale transcripts."
+        },
+        "alpha.task.async": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run task subagents in the background and expose them through the job tool."
+        },
+        "alpha.task.maxConcurrency": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Maximum task subagents running concurrently in one Alpha task call."
+        },
+        "alpha.task.maxOutputBytes": {
+          "type": "number",
+          "default": 500000,
+          "minimum": 1000,
+          "description": "Maximum visible bytes from one subagent result before full output is stored as an artifact."
+        },
+        "alpha.task.maxOutputLines": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 100,
+          "description": "Maximum visible lines from one subagent result before full output is stored as an artifact."
+        },
+        "alpha.eval.js": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable JavaScript eval cells."
+        },
+        "alpha.eval.py": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Python eval cells when python3 is available."
         }
       }
     }

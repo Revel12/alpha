@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
 import { buildAlphaSystemPrompt } from "./promptBuilder";
+import {
+  buildModelTranscript,
+  limitTranscriptHistory,
+  wrapCompactionForModel,
+  wrapInternalForModel,
+} from "./transcript";
+import type { AlphaTranscriptEntry } from "./transcript";
 import { getAdvertisedAlphaLanguageModelTools, runRegisteredAlphaTool } from "./toolRegistry";
 import type { AlphaToolSelection } from "./toolRegistry";
 import type { AlphaContext } from "./types";
@@ -16,7 +23,7 @@ export async function answerWithAlphaTools(prompt: string, ctx: AlphaContext): P
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const pendingResolve = ctx.pendingEdits.list().length > 0;
-    const selection = pendingResolve ? { ctx, forceTools: ["resolve"], onlyForced: true } : { ...baseSelection, ctx };
+    const selection = pendingResolve ? { ctx, forceTools: ["resolve"], onlyForced: true } : getBaseToolSelection(ctx);
     const activeTools = getAdvertisedAlphaLanguageModelTools(
       selection,
     );
@@ -67,53 +74,45 @@ export async function answerWithAlphaTools(prompt: string, ctx: AlphaContext): P
 }
 
 function buildInitialMessages(prompt: string, ctx: AlphaContext, baseSelection: AlphaToolSelection): vscode.LanguageModelChatMessage[] {
-  const messages: vscode.LanguageModelChatMessage[] = [
-    vscode.LanguageModelChatMessage.User(buildAlphaSystemPrompt(ctx, baseSelection)),
-  ];
+  const maxHistoryTurns = vscode.workspace.getConfiguration("alpha").get<number>("session.maxHistoryTurns", 30);
+  const boundedMaxHistoryTurns = Math.max(0, maxHistoryTurns);
+  const historyTranscript = boundedMaxHistoryTurns <= 0
+    ? ctx.transcript.filter((entry) => entry.historyIndex === undefined)
+    : limitTranscriptHistory(ctx.transcript, boundedMaxHistoryTurns, ctx.chatContext.history.length);
+  const omitted = Math.max(0, ctx.chatContext.history.length - boundedMaxHistoryTurns);
+  const modelTranscript = buildModelTranscript({
+    internalPrompt: buildAlphaSystemPrompt(ctx, baseSelection),
+    historyTranscript,
+    currentPrompt: prompt,
+    omittedHistoryTurns: omitted,
+  });
+  return modelTranscript.map(transcriptEntryToLanguageModelMessage);
+}
 
-  for (const turn of ctx.chatContext.history) {
-    if (isChatRequestTurn(turn)) {
-      messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
-      continue;
-    }
-
-    if (isChatResponseTurn(turn)) {
-      const text = chatResponseTurnText(turn);
-      if (text.trim()) messages.push(vscode.LanguageModelChatMessage.Assistant(text));
-    }
+function transcriptEntryToLanguageModelMessage(entry: AlphaTranscriptEntry): vscode.LanguageModelChatMessage {
+  if (entry.role === "assistant") {
+    return vscode.LanguageModelChatMessage.Assistant(entry.content);
   }
-
-  messages.push(vscode.LanguageModelChatMessage.User(prompt));
-  return messages;
-}
-
-function chatResponseTurnText(turn: vscode.ChatResponseTurn): string {
-  const parts: string[] = [];
-  for (const part of turn.response) {
-    if (isMarkdownResponsePart(part)) {
-      parts.push(part.value.value);
-    }
+  if (entry.role === "internal") {
+    return vscode.LanguageModelChatMessage.User(wrapInternalForModel(entry.content, entry.source), "alpha_internal");
   }
-  return parts.join("\n\n");
-}
-
-function isChatRequestTurn(turn: vscode.ChatRequestTurn | vscode.ChatResponseTurn): turn is vscode.ChatRequestTurn {
-  return "prompt" in turn;
-}
-
-function isChatResponseTurn(turn: vscode.ChatRequestTurn | vscode.ChatResponseTurn): turn is vscode.ChatResponseTurn {
-  return "response" in turn;
-}
-
-function isMarkdownResponsePart(part: vscode.ChatResponseTurn["response"][number]): part is vscode.ChatResponseMarkdownPart {
-  const candidate = part as { value?: { value?: unknown } };
-  return typeof candidate.value?.value === "string";
+  if (entry.role === "compaction") {
+    return vscode.LanguageModelChatMessage.User(wrapCompactionForModel(entry.content), "alpha_internal");
+  }
+  return vscode.LanguageModelChatMessage.User(entry.content, "user");
 }
 
 function getBaseToolSelection(ctx: AlphaContext): AlphaToolSelection {
   const discoveryMode = vscode.workspace.getConfiguration("alpha").get<"off" | "all">("tools.discoveryMode", "off");
+  if (discoveryMode === "all") {
+    return {
+      ctx,
+      includeDiscoverable: false,
+      forceTools: ["search_tool_bm25", ...ctx.discoveredTools.list()],
+    };
+  }
   return {
     ctx,
-    includeDiscoverable: discoveryMode !== "all",
+    includeDiscoverable: true,
   };
 }

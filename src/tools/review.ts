@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { wrapInternalForModel } from "../transcript";
 import type { ToolDefinition } from "../types";
 
 export const reviewTool: ToolDefinition = {
@@ -10,9 +11,13 @@ export const reviewTool: ToolDefinition = {
 
     const messages = [
       vscode.LanguageModelChatMessage.User(
-        "You are Alpha, an OMP-style code review helper. Return concise findings with file/line references when possible. Do not produce patches unless asked.",
+        wrapInternalForModel(
+          "You are Alpha, an OMP-style code review helper. Return concise findings with file/line references when possible. Do not produce patches unless asked.",
+          "alpha-system",
+        ),
+        "alpha_internal",
       ),
-      vscode.LanguageModelChatMessage.User(input),
+      vscode.LanguageModelChatMessage.User(input, "user"),
     ];
     const response = await ctx.request.model.sendRequest(messages, {}, ctx.token);
     let markdown = "";

@@ -1,9 +1,14 @@
 import * as vscode from "vscode";
+import type { AlphaTranscriptEntry } from "./transcript";
 
 export interface AlphaContext {
   extensionContext: vscode.ExtensionContext;
+  sessionKey: string;
+  sessionLabel: string;
+  compactionSummary?: string;
   request: vscode.ChatRequest;
   chatContext: vscode.ChatContext;
+  transcript: AlphaTranscriptEntry[];
   stream: vscode.ChatResponseStream;
   token: vscode.CancellationToken;
   pendingEdits: PendingEditStore;
@@ -11,6 +16,8 @@ export interface AlphaContext {
   snapshots: FileSnapshotStore;
   artifacts: ArtifactStore;
   bashJobs: BashJobStore;
+  permissionDecisions: PermissionDecisionStore;
+  discoveredTools: DiscoveredToolStore;
 }
 
 export interface ToolResult {
@@ -28,6 +35,7 @@ export interface PendingEdit {
   label: string;
   createdAt: string;
   edits: WorkspaceTextEdit[];
+  expectedTags?: Record<string, string>;
 }
 
 export interface WorkspaceTextEdit {
@@ -51,9 +59,19 @@ export interface TodoItem {
   status: TodoStatus;
 }
 
+export interface TodoPhase {
+  name: string;
+  tasks: TodoItem[];
+}
+
+export interface TodoCompletionTransition {
+  phase: string;
+  content: string;
+}
+
 export interface TodoStore {
-  list(): TodoItem[];
-  set(items: TodoItem[]): void;
+  list(): TodoPhase[];
+  set(phases: TodoPhase[]): void;
 }
 
 export interface FileSnapshot {
@@ -67,6 +85,7 @@ export interface FileSnapshotStore {
   record(path: string, content: string): FileSnapshot;
   get(path: string, tag: string): FileSnapshot | undefined;
   has(path: string, tag: string): boolean;
+  list(): FileSnapshot[];
   clear(): void;
 }
 
@@ -75,6 +94,7 @@ export interface Artifact {
   label: string;
   content: string;
   createdAt: string;
+  filePath?: string;
 }
 
 export interface ArtifactStore {
@@ -84,10 +104,11 @@ export interface ArtifactStore {
   clear(): void;
 }
 
-export type BashJobStatus = "running" | "completed" | "failed";
+export type BashJobStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface BashJob {
   id: string;
+  type?: "bash" | "task";
   command: string;
   cwd: string;
   createdAt: string;
@@ -105,5 +126,19 @@ export interface BashJobStore {
   update(id: string, patch: Partial<Omit<BashJob, "id" | "createdAt">>): BashJob | undefined;
   get(id: string): BashJob | undefined;
   list(): BashJob[];
+  clear(): void;
+}
+
+export type PermissionPersistence = "allow_always" | "reject_always";
+
+export interface PermissionDecisionStore {
+  get(key: string): PermissionPersistence | undefined;
+  set(key: string, value: PermissionPersistence): void;
+  clear(): void;
+}
+
+export interface DiscoveredToolStore {
+  list(): string[];
+  add(names: readonly string[]): string[];
   clear(): void;
 }

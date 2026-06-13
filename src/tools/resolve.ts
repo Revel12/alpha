@@ -1,5 +1,8 @@
+import * as vscode from "vscode";
+import { contentTag } from "../hash";
 import { applyWorkspaceEdits } from "../patch/hashline";
 import type { ToolDefinition } from "../types";
+import { readOpenDocumentText, relativePath, resolveWorkspaceFile } from "../workspace";
 
 interface ResolveInput {
   action: "apply" | "discard";
@@ -28,11 +31,52 @@ export const resolveTool: ToolDefinition = {
       return { markdown: `Discarded ${pending.id}. Reason: ${input.reason}` };
     }
 
+    const maxBytes = vscode.workspace.getConfiguration("alpha").get<number>("read.maxBytes", 200000);
+    const stale = await stalePendingFiles(pending.expectedTags, maxBytes);
+    if (stale.length) {
+      return {
+        markdown: `Preview is stale / no longer matches; no edits were applied.\n${stale.map((item) => `- ${item.path}: expected ${item.expected}, current ${item.current}`).join("\n")}`,
+      };
+    }
+
     const ok = await applyWorkspaceEdits(pending.edits);
     if (ok) ctx.pendingEdits.remove(pending.id);
-    return { markdown: ok ? `Applied ${pending.id}. Reason: ${input.reason}` : `VS Code rejected ${pending.id}.` };
+    if (!ok) return { markdown: `VS Code rejected ${pending.id}.` };
+
+    const freshTags: string[] = [];
+    for (const uri of uniqueUris(pending.edits.map((edit) => edit.uri))) {
+      const filePath = relativePath(uri);
+      const text = await readOpenDocumentText(uri, maxBytes);
+      const snapshot = ctx.snapshots.record(filePath, text);
+      freshTags.push(`[${filePath}#${snapshot.tag}]`);
+    }
+    const tagText = freshTags.length ? `\n${freshTags.join("\n")}` : "";
+    return { markdown: `Applied ${pending.id}. Reason: ${input.reason}${tagText}` };
   },
 };
+
+async function stalePendingFiles(expectedTags: Record<string, string> | undefined, maxBytes: number): Promise<Array<{ path: string; expected: string; current: string }>> {
+  if (!expectedTags) return [];
+  const stale: Array<{ path: string; expected: string; current: string }> = [];
+  for (const [filePath, expected] of Object.entries(expectedTags)) {
+    const uri = await resolveWorkspaceFile(filePath);
+    const text = await readOpenDocumentText(uri, maxBytes);
+    const current = contentTag(text);
+    if (current !== expected.toUpperCase()) stale.push({ path: filePath, expected: expected.toUpperCase(), current });
+  }
+  return stale;
+}
+
+function uniqueUris(uris: vscode.Uri[]): vscode.Uri[] {
+  const seen = new Set<string>();
+  const unique: vscode.Uri[] = [];
+  for (const uri of uris) {
+    if (seen.has(uri.toString())) continue;
+    seen.add(uri.toString());
+    unique.push(uri);
+  }
+  return unique;
+}
 
 function parseResolveInput(args: string): ResolveInput {
   const trimmed = args.trim();

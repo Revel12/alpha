@@ -1,5 +1,17 @@
 import * as vscode from "vscode";
 import { renderAnchoredFileWithTag } from "../hash";
+import { isInternalUrlPath, resolveInternalUrl, type InternalResource } from "../internalUrls";
+import {
+  isWebUrlPath,
+  readArchiveTarget,
+  readSpecialFile,
+  readSqliteTarget,
+  readWebUrl,
+  splitArchiveTarget,
+  splitSqliteTarget,
+  structuralSummary,
+  type ReadAdapterResult,
+} from "../readAdapters";
 import type { AlphaContext, ToolDefinition } from "../types";
 import { readDirectory, readText, relativePath, resolveExistingWorkspacePath, stat } from "../workspace";
 
@@ -7,6 +19,7 @@ interface ReadTarget {
   path: string;
   raw: boolean;
   conflicts: boolean;
+  summary: boolean;
   explicitSelector: boolean;
   ranges?: ReadRange[];
 }
@@ -29,8 +42,38 @@ export const readTool: ToolDefinition = {
       return readActiveEditor(target, ctx);
     }
 
-    if (target.path.startsWith("artifact://")) {
-      return readArtifact(target, ctx);
+    if (isWebUrlPath(target.path)) {
+      const resource = await readWebUrl(target.path, target.raw);
+      if (target.raw) return { markdown: renderRawContent(resource.content, target.ranges) };
+      return { markdown: renderAdapterResource(resource, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
+    }
+
+    if (isInternalUrlPath(target.path)) {
+      const resource = await resolveInternalUrl(target.path, ctx);
+      if (target.raw) return { markdown: renderRawContent(resource.content, target.ranges) };
+      return {
+        markdown: renderAdapterResource(resource, target.ranges, target.explicitSelector ? undefined : defaultLimit),
+      };
+    }
+
+    const archiveTarget = splitArchiveTarget(target.path);
+    if (archiveTarget) {
+      const archiveUri = await resolveExistingWorkspacePath(archiveTarget.archivePath);
+      const bytes = await vscode.workspace.fs.readFile(archiveUri);
+      const archivePath = relativePath(archiveUri);
+      const resource = await readArchiveTarget(archivePath, bytes, archiveTarget.memberPath);
+      if (target.raw) return { markdown: renderRawContent(resource.content, target.ranges) };
+      return { markdown: renderAdapterResource(resource, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
+    }
+
+    const sqliteTarget = splitSqliteTarget(target.path);
+    if (sqliteTarget) {
+      const dbUri = await resolveExistingWorkspacePath(sqliteTarget.dbPath);
+      const dbPath = relativePath(dbUri);
+      const resource = await readSqliteTarget(dbUri.fsPath, sqliteTarget.selector);
+      resource.label = resource.label.replace(dbUri.fsPath, dbPath);
+      if (target.raw) return { markdown: renderRawContent(resource.content, target.ranges) };
+      return { markdown: renderAdapterResource(resource, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
     }
 
     const uri = await resolveExistingWorkspacePath(target.path);
@@ -40,12 +83,23 @@ export const readTool: ToolDefinition = {
       return { markdown: await renderDirectory(uri) };
     }
 
+    const path = relativePath(uri);
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const special = readSpecialFile(path, bytes, target.raw);
+    if (special) {
+      if (target.raw) return { markdown: renderRawContent(special.content, target.ranges) };
+      return { markdown: renderAdapterResource(special, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
+    }
+
     const content = await readText(uri, maxBytes);
     if (target.raw) return { markdown: renderRawContent(content, target.ranges) };
 
-    const path = relativePath(uri);
     const snapshot = ctx.snapshots.record(path, content);
     if (target.conflicts) return { markdown: renderConflicts(path, content, snapshot.tag) };
+    if (target.summary || (!target.explicitSelector && !target.ranges?.length)) {
+      const summary = structuralSummary(path, content);
+      if (summary) return { markdown: [`[${path}#${snapshot.tag}]`, "```text", summary, "```"].join("\n") };
+    }
     return { markdown: renderContent(path, content, snapshot.tag, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
   },
 };
@@ -54,7 +108,14 @@ export function parseReadTarget(input: string): ReadTarget {
   let rest = input.trim();
   let raw = false;
   let conflicts = false;
+  let summary = false;
   let explicitSelector = false;
+
+  if (rest.endsWith(":summary")) {
+    summary = true;
+    explicitSelector = true;
+    rest = rest.slice(0, -8);
+  }
 
   if (rest.endsWith(":conflicts")) {
     conflicts = true;
@@ -84,25 +145,10 @@ export function parseReadTarget(input: string): ReadTarget {
     path: rest,
     raw,
     conflicts,
+    summary,
     explicitSelector,
     ranges: rangeSuffix ? parseRanges(rangeSuffix[1]) : undefined,
   };
-}
-
-function readArtifact(target: ReadTarget, ctx: AlphaContext): { markdown: string } {
-  const id = target.path.slice("artifact://".length).replace(/^\/+/, "");
-  if (!id) {
-    const artifacts = ctx.artifacts.list();
-    if (!artifacts.length) return { markdown: "No Alpha artifacts." };
-    return {
-      markdown: ["[artifact://]", "```text", ...artifacts.map((artifact) => `${artifact.id}\t${artifact.label}\t${artifact.createdAt}`), "```"].join("\n"),
-    };
-  }
-
-  const artifact = ctx.artifacts.get(id);
-  if (!artifact) throw new Error(`Artifact not found: artifact://${id}`);
-  if (target.raw) return { markdown: renderRawContent(artifact.content, target.ranges) };
-  return { markdown: renderArtifactContent(id, artifact.label, artifact.content, target.ranges, target.explicitSelector ? undefined : 200) };
 }
 
 async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<{ markdown: string }> {
@@ -122,6 +168,11 @@ async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<
 
   if (target.conflicts) return { markdown: renderConflicts(path, fullText, tag) };
   if (target.raw) return { markdown: renderRawContent(fullText, target.ranges) };
+
+  if (target.summary || (!target.explicitSelector && !target.ranges?.length)) {
+    const summary = structuralSummary(path, fullText);
+    if (summary) return { markdown: [`[${path}#${tag}]`, "```text", summary, "```"].join("\n") };
+  }
 
   return { markdown: renderContent(path, fullText, tag, target.ranges, target.explicitSelector ? undefined : 200) };
 }
@@ -179,9 +230,8 @@ function renderContent(path: string, content: string, tag: string, ranges?: Read
   return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
 }
 
-function renderArtifactContent(id: string, label: string, content: string, ranges?: ReadRange[], defaultLimit?: number): string {
-  const header = `[artifact://${id} ${label}]`;
-  const lines = content.split(/\r?\n/);
+function renderAdapterResource(resource: InternalResource | ReadAdapterResult, ranges?: ReadRange[], defaultLimit?: number): string {
+  const lines = resource.content.split(/\r?\n/);
   const selected: string[] = [];
   const effectiveRanges = ranges?.length ? ranges : [{ startLine: 1, endLine: defaultLimit ? Math.min(defaultLimit, lines.length) : lines.length }];
 
@@ -193,10 +243,14 @@ function renderArtifactContent(id: string, label: string, content: string, range
   }
 
   if (!ranges?.length && defaultLimit && lines.length > defaultLimit) {
-    selected.push(`[${lines.length - defaultLimit} lines elided; re-read needed ranges, e.g. artifact://${id}:${defaultLimit + 1}-${Math.min(lines.length, defaultLimit + 80)}]`);
+    selected.push(`[${lines.length - defaultLimit} lines elided; re-read needed ranges, e.g. ${resourceLabel(resource)}:${defaultLimit + 1}-${Math.min(lines.length, defaultLimit + 80)}]`);
   }
 
-  return [header, "```text", ...selected, "```"].join("\n");
+  return [`[${resource.label}]`, "```text", ...selected, "```"].join("\n");
+}
+
+function resourceLabel(resource: InternalResource | ReadAdapterResult): string {
+  return "url" in resource ? resource.url : resource.label;
 }
 
 function renderRawContent(content: string, ranges?: ReadRange[]): string {
