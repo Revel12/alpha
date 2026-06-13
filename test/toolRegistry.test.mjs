@@ -23,16 +23,24 @@ import {
   resolveApproval,
   sshApproval,
   taskApproval,
+  webSearchApproval,
   writeApproval,
 } from "../out/approvalCore.js";
 import {
   notebookToText,
   readArchiveTarget,
   readImageMetadata,
+  readWebUrl,
   splitArchiveTarget,
   splitSqliteTarget,
   structuralSummary,
 } from "../out/readAdapters.js";
+import {
+  duckDuckGoHtmlUrl,
+  formatWebSearchForLlm,
+  parseDuckDuckGoHtml,
+  parseWebSearchInput,
+} from "../out/webSearchCore.js";
 import { InMemoryArtifactStore, InMemoryFileSnapshotStore, InMemoryTodoStore } from "../out/store.js";
 import { InMemoryBashJobStore, InMemoryDiscoveredToolStore } from "../out/store.js";
 import { jobTool } from "../out/tools/job.js";
@@ -118,7 +126,7 @@ import {
 test("public tools are advertised by default", () => {
   const names = getAdvertisedAlphaLanguageModelTools().map((tool) => tool.name);
 
-  assert.deepEqual(names, ["read", "bash", "search", "find", "edit", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
+  assert.deepEqual(names, ["read", "bash", "search", "find", "web_search", "edit", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
 });
 
 test("normalized transcript finds the first real user message", () => {
@@ -214,7 +222,7 @@ test("essential-only selection follows OMP-style load modes", () => {
 });
 
 test("discoverable public tools are classified separately from essentials", () => {
-  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
+  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "web_search", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
 });
 
 test("registry names are unique", () => {
@@ -271,6 +279,16 @@ test("find exposes OMP-style paths contract", () => {
   assert.equal(find.inputSchema.properties.gitignore.type, "boolean");
   assert.equal(find.inputSchema.properties.limit.type, "number");
   assert.equal(find.inputSchema.properties.timeout.type, "number");
+});
+
+test("web_search exposes OMP-style query contract", () => {
+  const tool = getAlphaToolRegistration("web_search");
+
+  assert.deepEqual(tool.inputSchema.required, ["query"]);
+  assert.equal(tool.inputSchema.properties.query.type, "string");
+  assert.deepEqual(tool.inputSchema.properties.recency.enum, ["day", "week", "month", "year"]);
+  assert.equal(tool.inputSchema.properties.limit.type, "number");
+  assert.equal(tool.inputSchema.properties.num_search_results.type, "number");
 });
 
 test("lsp exposes OMP-style action contract", () => {
@@ -1133,6 +1151,7 @@ test("approval tool tier mapping matches current and planned OMP tools", () => {
   assert.equal(writeApproval({ path: "local://PLAN.md", content: "x" }), "read");
   assert.equal(sshApproval({}), "exec");
   assert.equal(browserApproval({}), "exec");
+  assert.equal(webSearchApproval({}), "read");
   assert.equal(bitbucketApproval({ op: "pr_view" }), "read");
   assert.equal(bitbucketApproval({ op: "pr_create" }), "exec");
   assert.equal(lspApproval({ action: "references" }), "read");
@@ -1202,6 +1221,45 @@ test("read adapter parses OMP-style archive and sqlite targets", () => {
     dbPath: "data/app.db",
     selector: "?q=select%201",
   });
+});
+
+test("web_search core parses DuckDuckGo HTML into OMP-style sources", () => {
+  const input = parseWebSearchInput({ query: "alpha harness", recency: "week", limit: 2 });
+  assert.equal(input.query, "alpha harness");
+  assert.equal(input.recency, "week");
+  assert.match(duckDuckGoHtmlUrl(input), /html\.duckduckgo\.com\/html\/\?q=alpha\+harness&df=w/);
+
+  const html = `
+    <html><body>
+      <div class="result">
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc">Example &amp; Docs</a>
+        <a class="result__snippet">Official docs snippet</a>
+      </div>
+    </body></html>`;
+  const sources = parseDuckDuckGoHtml(html, 10);
+  assert.deepEqual(sources, [{
+    title: "Example & Docs",
+    url: "https://example.com/doc",
+    snippet: "Official docs snippet",
+  }]);
+  assert.match(formatWebSearchForLlm({ provider: "duckduckgo_html", sources, searchQueries: ["alpha harness"] }), /\[1\] Example & Docs/);
+});
+
+test("read adapter converts fetched HTML URLs into markdown-like reader text", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    "<html><head><title>Example Page</title></head><body><main><h1>Hello</h1><p>Read <a href='/docs'>docs</a>.</p></main></body></html>",
+    { status: 200, headers: { "content-type": "text/html" } },
+  );
+  try {
+    const result = await readWebUrl("https://example.com/page", false);
+    assert.equal(result.label, "https://example.com/page (text/html)");
+    assert.match(result.content, /# Example Page/);
+    assert.match(result.content, /# Hello/);
+    assert.match(result.content, /docs \(https:\/\/example.com\/docs\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("read adapter converts notebooks into editable cell text", () => {

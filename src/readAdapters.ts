@@ -32,13 +32,38 @@ export function isWebUrlPath(input: string): boolean {
 }
 
 export async function readWebUrl(input: string, raw: boolean): Promise<ReadAdapterResult> {
-  const response = await fetch(input);
+  const response = await fetch(input, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 AppleWebKit/537.36 Chrome/124 Safari/537.36",
+      Accept: raw ? "*/*" : "text/markdown, text/plain;q=0.9, text/html;q=0.8, application/json;q=0.7, */*;q=0.5",
+    },
+  });
   if (!response.ok) {
     throw new Error(`URL read failed: ${response.status} ${response.statusText}`);
   }
 
   const contentType = response.headers.get("content-type") ?? "";
-  const text = await response.text();
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!raw && (contentType.includes("application/pdf") || input.toLowerCase().split(/[?#]/)[0]?.endsWith(".pdf"))) {
+    return {
+      label: `${input} (${contentType.split(";")[0] || "application/pdf"})`,
+      content: extractPdfText(bytes),
+      immutable: true,
+    };
+  }
+
+  if (!raw) {
+    const image = readImageMetadata(input, bytes);
+    if (image && contentType.startsWith("image/")) {
+      return {
+        label: `${input} (${contentType.split(";")[0]})`,
+        content: formatImageMetadata(image),
+        immutable: true,
+      };
+    }
+  }
+
+  const text = textDecoder.decode(bytes);
   let content = text;
 
   if (!raw) {
@@ -49,7 +74,7 @@ export async function readWebUrl(input: string, raw: boolean): Promise<ReadAdapt
         content = text;
       }
     } else if (contentType.includes("html") || /<html[\s>]/i.test(text)) {
-      content = htmlToText(text);
+      content = htmlToMarkdown(text, input);
     }
   }
 
@@ -435,17 +460,45 @@ function xmlToText(input: string): string {
 }
 
 function htmlToText(input: string): string {
-  return decodeXml(
-    input
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<\/(h[1-6]|p|div|li|tr|section|article)>/gi, "\n")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<[^>]+>/g, " "),
-  )
-    .replace(/[ \t]{2,}/g, " ")
+  return htmlToMarkdown(input);
+}
+
+function htmlToMarkdown(input: string, sourceUrl = ""): string {
+  let html = input
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "");
+
+  const title = decodeXml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").replace(/\s+/g, " ").trim();
+  const main = html.match(/<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i)?.[2];
+  if (main && main.length > 500) html = main;
+
+  html = html
+    .replace(/<pre[^>]*>\s*<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi, (_all, code: string) => `\n\n\`\`\`\n${decodeXml(code).trim()}\n\`\`\`\n\n`)
+    .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_all, code: string) => `\n\n\`\`\`\n${decodeXml(stripHtml(code)).trim()}\n\`\`\`\n\n`)
+    .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_all, value: string) => `\n\n# ${inlineMarkdown(value)}\n\n`)
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_all, value: string) => `\n\n## ${inlineMarkdown(value)}\n\n`)
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, (_all, value: string) => `\n\n### ${inlineMarkdown(value)}\n\n`)
+    .replace(/<h[4-6][^>]*>([\s\S]*?)<\/h[4-6]>/gi, (_all, value: string) => `\n\n#### ${inlineMarkdown(value)}\n\n`)
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_all, value: string) => `\n- ${inlineMarkdown(value)}`)
+    .replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_all, href: string, text: string) => {
+      const label = inlineMarkdown(text);
+      const resolved = resolveHref(href, sourceUrl);
+      return label && resolved ? `${label} (${resolved})` : label || resolved;
+    })
+    .replace(/<\/(p|div|section|article|tr|table|ul|ol|blockquote)>/gi, "\n\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  const body = decodeXml(html)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[ \t]{2,}/g, " ").trimEnd())
+    .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  return [title ? `# ${title}` : undefined, body].filter(Boolean).join("\n\n").trim();
 }
 
 function decodeXml(input: string): string {
@@ -455,6 +508,22 @@ function decodeXml(input: string): string {
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, "\"")
     .replace(/&#39;/g, "'");
+}
+
+function inlineMarkdown(input: string): string {
+  return decodeXml(stripHtml(input)).replace(/\s+/g, " ").trim();
+}
+
+function stripHtml(input: string): string {
+  return input.replace(/<[^>]+>/g, " ");
+}
+
+function resolveHref(href: string, sourceUrl: string): string {
+  try {
+    return new URL(href, sourceUrl || "https://example.invalid").href;
+  } catch {
+    return href;
+  }
 }
 
 function sourceToText(source: string | string[] | undefined): string {

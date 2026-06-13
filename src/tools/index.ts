@@ -11,6 +11,7 @@ import { reviewTool } from "./review";
 import { searchTool } from "./search";
 import { taskTool } from "./task";
 import { todoTool } from "./todo";
+import { webSearchTool } from "./webSearch";
 import { writeTool } from "./write";
 
 export const tools: ToolDefinition[] = [
@@ -18,6 +19,7 @@ export const tools: ToolDefinition[] = [
   bashTool,
   searchTool,
   findTool,
+  webSearchTool,
   editTool,
   writeTool,
   lspTool,

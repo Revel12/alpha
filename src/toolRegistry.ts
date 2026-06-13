@@ -136,6 +136,26 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     toArgs: (input) => JSON.stringify(input),
   },
   {
+    name: "web_search",
+    visibility: "public",
+    loadMode: "discoverable",
+    description: "Search the web for up-to-date information beyond model knowledge. Alpha currently provides an OMP-style DuckDuckGo HTML provider when alpha.webSearch.provider is duckduckgo_html; use read for known URLs and page contents.",
+    inputSchema: objectSchema(
+      {
+        query: stringProperty("Search query."),
+        recency: { type: "string", enum: ["day", "week", "month", "year"], description: "Optional recency filter." },
+        limit: { type: "number", description: "Max results to return." },
+        max_tokens: { type: "number", description: "OMP compatibility field; ignored by DuckDuckGo HTML provider." },
+        temperature: { type: "number", description: "OMP compatibility field; ignored by DuckDuckGo HTML provider." },
+        num_search_results: { type: "number", description: "Number of search results to request/return." },
+      },
+      ["query"],
+    ),
+    enabled: alwaysEnabled,
+    loadTool: async () => (await import("./tools/webSearch.js")).webSearchTool,
+    toArgs: (input) => JSON.stringify(input),
+  },
+  {
     name: "edit",
     visibility: "public",
     loadMode: "essential",

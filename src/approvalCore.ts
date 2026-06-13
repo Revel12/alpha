@@ -226,6 +226,10 @@ export function browserApproval(): ToolApprovalDecision {
   return "exec";
 }
 
+export function webSearchApproval(): ToolApprovalDecision {
+  return "read";
+}
+
 export function bitbucketApproval(args: unknown): ToolApprovalDecision {
   const op = (getStringProperty(args, "op") ?? "").toLowerCase();
   return BITBUCKET_READONLY_OPS.has(op) ? "read" : "exec";

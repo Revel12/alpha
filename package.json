@@ -25,7 +25,7 @@
         "id": "alpha.participant",
         "name": "a",
         "fullName": "Alpha",
-        "description": "OMP-style local coding harness with read/bash/edit/search/find/write/lsp/bitbucket/task/eval/todo tools."
+        "description": "OMP-style local coding harness with read/bash/edit/search/find/web_search/write/lsp/bitbucket/task/eval/todo tools."
       }
     ],
     "commands": [
@@ -87,6 +87,15 @@
           "default": 50000,
           "minimum": 1000,
           "description": "Maximum visible bytes returned by find before full output is stored as an artifact."
+        },
+        "alpha.webSearch.provider": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "duckduckgo_html"
+          ],
+          "default": "duckduckgo_html",
+          "description": "Provider for Alpha web_search. duckduckgo_html uses https://html.duckduckgo.com/html/ without an API key; set disabled when public web search is not approved."
         },
         "alpha.read.maxBytes": {
           "type": "number",

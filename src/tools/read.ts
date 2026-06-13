@@ -43,7 +43,7 @@ export const readTool: ToolDefinition = {
     }
 
     if (isWebUrlPath(target.path)) {
-      const resource = await readWebUrl(target.path, target.raw);
+      const resource = await readWebUrlWithFallback(target.path, target.raw, ctx);
       if (target.raw) return { markdown: renderRawContent(resource.content, target.ranges) };
       return { markdown: renderAdapterResource(resource, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
     }
@@ -103,6 +103,40 @@ export const readTool: ToolDefinition = {
     return { markdown: renderContent(path, content, snapshot.tag, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
   },
 };
+
+async function readWebUrlWithFallback(path: string, raw: boolean, ctx: AlphaContext): Promise<ReadAdapterResult> {
+  try {
+    return await readWebUrl(path, raw);
+  } catch (error) {
+    if (raw || !vscode.lm.tools.some((tool) => tool.name === "copilot_fetchWebPage")) {
+      throw error;
+    }
+    const result = await vscode.lm.invokeTool("copilot_fetchWebPage", {
+      toolInvocationToken: ctx.request.toolInvocationToken,
+      input: {
+        urls: [path],
+        query: "Extract the main readable page content as concise markdown or plain text.",
+      },
+    }, ctx.token);
+    const content = languageModelToolResultToText(result);
+    if (!content.trim()) throw error;
+    return {
+      label: `${path} (copilot_fetchWebPage)`,
+      content,
+      immutable: true,
+    };
+  }
+}
+
+function languageModelToolResultToText(result: vscode.LanguageModelToolResult): string {
+  return result.content.map((part) => {
+    if (part instanceof vscode.LanguageModelTextPart) return part.value;
+    if (part && typeof part === "object" && "value" in part && typeof (part as { value?: unknown }).value === "string") {
+      return (part as { value: string }).value;
+    }
+    return String(part);
+  }).join("\n");
+}
 
 export function parseReadTarget(input: string): ReadTarget {
   let rest = input.trim();
