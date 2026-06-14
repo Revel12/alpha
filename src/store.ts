@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { InMemoryConflictStore } from "./conflictCore";
 import { contentTag } from "./hash";
 import type {
   Artifact,
@@ -17,6 +18,8 @@ import type {
   TodoPhase,
   TodoStore,
 } from "./types";
+
+export { InMemoryConflictStore };
 
 export class InMemoryPendingEditStore implements PendingEditStore {
   private edits: PendingEdit[] = [];

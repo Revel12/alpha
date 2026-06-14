@@ -4,6 +4,15 @@ import { ensureToolPermission } from "../approval";
 import { registerAsyncBashController, unregisterAsyncBashController } from "../asyncBashJobs";
 import { taskApproval, taskApprovalDetails } from "../approvalCore";
 import {
+  injectReviewFindings,
+  parseReportFindingDetails,
+  parseReviewYieldDetails,
+  toReviewFinding,
+  type ReviewFinding,
+  type ReviewFindingDetails,
+  type ReviewYieldDetails,
+} from "../reviewCore";
+import {
   DEFAULT_MAX_CONCURRENCY,
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_MAX_OUTPUT_LINES,
@@ -30,7 +39,11 @@ import { wrapInternalForModel } from "../transcript";
 import type { AlphaContext, ToolDefinition } from "../types";
 import { workspaceRoot } from "../workspace";
 
-const MAX_SUBAGENT_TOOL_ROUNDS = 8;
+const SUBAGENT_SOFT_REQUEST_BUDGETS: Record<string, number> = {
+  explore: 40,
+  quick_task: 40,
+  default: 90,
+};
 
 export const taskTool: ToolDefinition = {
   name: "task",
@@ -100,7 +113,7 @@ function startBackgroundTasks(params: TaskParams, agent: AgentDefinition, spawnI
         const artifact = ctx.artifacts.add(`task ${id} output`, result.output || result.stderr || "");
         ctx.bashJobs.update(job.id, {
           status: result.exitCode === 0 ? "completed" : "failed",
-          output: renderTaskSummary({ ...result, outputPath: `artifact://${artifact.id}` }),
+          output: renderTaskSummary({ ...result, outputPath: `agent://${id}` }),
           exitCode: result.exitCode,
           wallTimeMs: result.durationMs,
           artifactId: artifact.id,
@@ -201,7 +214,7 @@ async function runOneSpawn(
       truncated: truncated.truncated,
       durationMs: Math.round(performance.now() - startedAt),
       requests: progress.requests,
-      outputPath: `artifact://${artifact.id}`,
+      outputPath: `agent://${id}`,
     };
   } catch (error) {
     const aborted = isAborted(token);
@@ -250,9 +263,16 @@ async function runSubagentModelLoop(
       "alpha_internal",
     ),
   ];
+  const reportFindings: ReviewFinding[] = [];
+  const softRequestBudget = taskSoftRequestBudget(agent);
+  const hardRequestBudget = Math.ceil(softRequestBudget * 1.5);
+  let budgetSteerSent = false;
 
-  for (let round = 0; round < MAX_SUBAGENT_TOOL_ROUNDS; round++) {
+  while (true) {
     if (isAborted(token)) throw new Error("Subagent cancelled.");
+    if (progress.requests >= hardRequestBudget) {
+      throw new Error(`Subagent soft request budget exceeded (${progress.requests} requests; budget ${softRequestBudget}).`);
+    }
     progress.requests += 1;
     const response = await parentCtx.request.model.sendRequest(
       messages,
@@ -288,6 +308,10 @@ async function runSubagentModelLoop(
     for (const call of toolCalls) {
       progress.toolCount += 1;
       const result = await runRegisteredAlphaTool(call.name, call.input, subagentCtx, activeToolNames);
+      const completion = collectSubagentToolData(call.name, result.details, reportFindings);
+      if (completion) {
+        return finalizeSubagentYield(completion, reportFindings);
+      }
       progress.recentOutput.push(`${call.name}: ${result.markdown.slice(0, 500)}`);
       progress.recentOutput = progress.recentOutput.slice(-5);
       messages.push(
@@ -296,15 +320,48 @@ async function runSubagentModelLoop(
         ]),
       );
     }
-  }
 
-  throw new Error(`Subagent stopped after ${MAX_SUBAGENT_TOOL_ROUNDS} tool-call rounds.`);
+    if (!budgetSteerSent && progress.requests >= softRequestBudget) {
+      budgetSteerSent = true;
+      messages.push(
+        vscode.LanguageModelChatMessage.User(
+          wrapInternalForModel(buildSubagentBudgetNotice(progress.requests), "alpha-system"),
+          "alpha_internal",
+        ),
+      );
+    }
+  }
 }
 
 function toolsForAgent(agent: AgentDefinition, ctx: AlphaContext): vscode.LanguageModelChatTool[] {
   const requested = (agent.tools?.length ? agent.tools : ["read", "bash", "search", "find", "edit", "write", "lsp", "job", "todo"])
     .filter((name) => name !== "task");
   return getAdvertisedAlphaLanguageModelTools({ ctx, forceTools: requested, onlyForced: true });
+}
+
+function collectSubagentToolData(name: string, details: unknown, reportFindings: ReviewFinding[]): ReviewYieldDetails | undefined {
+  if (name === "report_finding") {
+    const finding = parseReportFindingDetails(details) ?? parseReportFindingDetails(detailsFromPlainObject(details));
+    if (finding) reportFindings.push(toReviewFinding(finding));
+    return undefined;
+  }
+  if (name === "yield") {
+    return parseReviewYieldDetails(details) ?? parseReviewYieldDetails(detailsFromPlainObject(details)) ?? {};
+  }
+  return undefined;
+}
+
+function finalizeSubagentYield(completion: ReviewYieldDetails, reportFindings: ReviewFinding[]): string {
+  if (completion.status === "aborted") {
+    const reason = completion.error ?? "Subagent aborted task.";
+    return JSON.stringify({ aborted: true, error: reason }, null, 2);
+  }
+  const data = completion.data === undefined ? {} : completion.data;
+  return JSON.stringify(injectReviewFindings(data, reportFindings), null, 2);
+}
+
+function detailsFromPlainObject(details: unknown): ReviewFindingDetails | ReviewYieldDetails | undefined {
+  return details && typeof details === "object" && !Array.isArray(details) ? details as ReviewFindingDetails | ReviewYieldDetails : undefined;
 }
 
 function toCancellationToken(token: vscode.CancellationToken | AbortSignal): vscode.CancellationToken {
@@ -343,6 +400,18 @@ function taskMaxOutputBytes(): number {
 
 function taskMaxOutputLines(): number {
   return Math.max(100, vscode.workspace.getConfiguration("alpha").get<number>("task.maxOutputLines", DEFAULT_MAX_OUTPUT_LINES));
+}
+
+function taskSoftRequestBudget(agent: AgentDefinition): number {
+  const override = vscode.workspace.getConfiguration("alpha").get<number>("task.softRequestBudgetOverride", 0);
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return Math.max(1, Math.min(500, Math.trunc(override)));
+  }
+  return SUBAGENT_SOFT_REQUEST_BUDGETS[agent.name] ?? SUBAGENT_SOFT_REQUEST_BUDGETS.default;
+}
+
+function buildSubagentBudgetNotice(requests: number): string {
+  return `[budget notice] You have used ${requests} requests in this run. Wrap up now: finish the current step and yield your final report.`;
 }
 
 function workspaceCwd(): string {

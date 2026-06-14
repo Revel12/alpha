@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { findExcludeGlob, findIncludeGlobs, matchesFindGlob, mergeFindEntries, parseFindInput, renderFindResults, truncateFindOutput } from "../findCore";
 import type { FindEntry } from "../findCore";
+import { isInternalUrlPath, resolveInternalUrl } from "../internalUrls";
 import type { ToolDefinition } from "../types";
 import { readDirectory, relativePath, stat, workspaceRoot } from "../workspace";
 
@@ -14,7 +15,9 @@ export const findTool: ToolDefinition = {
     const startedAt = Date.now();
     const timeoutMs = Math.round(input.timeout * 1000);
     const entries: FindEntry[] = [];
-    const includes = findIncludeGlobs(input);
+    const internalPaths = input.paths.filter(isInternalUrlPath);
+    const workspacePaths = input.paths.filter((path) => !isInternalUrlPath(path));
+    const includes = input.paths.length > 0 && workspacePaths.length === 0 ? [] : findIncludeGlobs({ paths: workspacePaths });
     const exclude = findExcludeGlob(input);
 
     for (const include of includes) {
@@ -32,6 +35,20 @@ export const findTool: ToolDefinition = {
 
     for (const entry of await collectMatchingDirectories(includes, input.hidden, timeoutMs, startedAt)) {
       entries.push(entry);
+    }
+
+    for (const internalPath of internalPaths) {
+      const resource = await resolveInternalUrl(internalPath, ctx);
+      if (!resource.sourcePath) {
+        entries.push({ path: resource.url, mtime: 0 });
+        continue;
+      }
+      try {
+        const fileStat = await vscode.workspace.fs.stat(vscode.Uri.file(resource.sourcePath));
+        entries.push({ path: resource.url, mtime: fileStat.mtime });
+      } catch {
+        entries.push({ path: resource.url, mtime: 0 });
+      }
     }
 
     const timedOut = Date.now() - startedAt > timeoutMs;

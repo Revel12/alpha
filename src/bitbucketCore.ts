@@ -61,6 +61,14 @@ export interface BitbucketAuthConfig {
   password?: string;
 }
 
+export interface BitbucketCodeSearchResult {
+  path: string;
+  repo?: string;
+  commit?: string;
+  url?: string;
+  match?: string;
+}
+
 export const BITBUCKET_OPS: readonly BitbucketOp[] = [
   "repo_view",
   "pr_view",
@@ -216,6 +224,62 @@ export function bitbucketSearchReposUrl(repo: BitbucketRepoRef, query: string | 
   if (query) url.searchParams.set("name", query);
   url.searchParams.set("limit", String(limit));
   return url.toString();
+}
+
+export function bitbucketCodeSearchUrls(repo: BitbucketRepoRef, input: Pick<BitbucketInput, "query" | "limit">, templates: readonly string[] = []): string[] {
+  const query = requireBitbucketCodeSearchQuery(input);
+  const values: Record<string, string> = {
+    baseUrl: repo.baseUrl,
+    project: repo.projectOrWorkspace,
+    workspace: repo.projectOrWorkspace,
+    slug: repo.slug,
+    repo: `${repo.projectOrWorkspace}/${repo.slug}`,
+    query,
+    limit: String(input.limit),
+  };
+  const defaultTemplates = repo.kind === "server"
+    ? [
+        "/rest/search/latest/search?query={query}&limit={limit}&project={project}&repository={slug}",
+        "/rest/search/latest/search?query={query}&limit={limit}&projectKey={project}&repositorySlug={slug}",
+        "/rest/search/latest/search?query={query}&limit={limit}&repo={repo}",
+      ]
+    : [];
+  return [...templates, ...defaultTemplates]
+    .filter((template) => template.trim())
+    .map((template) => expandBitbucketTemplate(template, repo.baseUrl, values));
+}
+
+export function requireBitbucketCodeSearchQuery(input: Pick<BitbucketInput, "query" | "since" | "until">): string {
+  if (input.since !== undefined || input.until !== undefined) {
+    throw new Error("search_code does not support since/until; Bitbucket code search has no portable date qualifier.");
+  }
+  const query = input.query?.trim();
+  if (!query) throw new Error("bitbucket search_code requires query.");
+  return query;
+}
+
+export function formatBitbucketCodeSearchResults(repo: BitbucketRepoRef, query: string, data: unknown, limit: number): string {
+  const items = normalizeBitbucketCodeSearchResults(data).slice(0, limit);
+  const lines: string[] = ["# Bitbucket code search", "", `Query: ${query}`, `Repository: ${repo.projectOrWorkspace}/${repo.slug}`, `Results: ${items.length}`];
+  if (!items.length) {
+    lines.push("", "No code matches found.");
+    return lines.join("\n");
+  }
+  for (const item of items) {
+    lines.push("");
+    lines.push(`- ${item.path || "(unknown path)"}`);
+    if (item.repo) lines.push(`  Repo: ${item.repo}`);
+    if (item.commit) lines.push(`  Commit: ${item.commit.slice(0, 12)}`);
+    if (item.url) lines.push(`  URL: ${item.url}`);
+    if (item.match) lines.push(`  Match: ${normalizeOneLine(item.match)}`);
+  }
+  return lines.join("\n");
+}
+
+export function normalizeBitbucketCodeSearchResults(data: unknown): BitbucketCodeSearchResult[] {
+  const root = asRecord(data);
+  const rawItems = firstNonEmptyArray(arrayField(root, "values"), arrayField(root, "items"), arrayField(root, "results"));
+  return rawItems.map(normalizeBitbucketCodeSearchResult).filter((item) => item.path || item.match);
 }
 
 export function bitbucketPrPayload(repo: BitbucketRepoRef, input: BitbucketInput): object {
@@ -466,6 +530,76 @@ function parseHttpsRemote(value: string, fallbackBaseUrl?: string): BitbucketRep
     return { kind, baseUrl, projectOrWorkspace: parts[projectIndex + 1], slug: stripGitSuffix(parts[repoIndex + 1]) };
   }
   return { kind, baseUrl, projectOrWorkspace: parts[0], slug: stripGitSuffix(parts[1]) };
+}
+
+function expandBitbucketTemplate(template: string, baseUrl: string, values: Record<string, string>): string {
+  const expanded = template.replace(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g, (match, key: string) => {
+    const value = values[key];
+    return value === undefined ? match : encodeURIComponent(value);
+  });
+  return /^https?:\/\//i.test(expanded) ? expanded : new URL(expanded.startsWith("/") ? expanded : `/${expanded}`, baseUrl).toString();
+}
+
+function normalizeBitbucketCodeSearchResult(value: unknown): BitbucketCodeSearchResult {
+  const row = asRecord(value);
+  const path = stringField(row, "path")
+    ?? stringField(row, "file")
+    ?? stringField(row, "name")
+    ?? nestedString(row, ["file", "path"])
+    ?? nestedString(row, ["path", "toString"])
+    ?? joinPathComponents(row["path"]);
+  const repo = nestedString(row, ["repository", "fullName"])
+    ?? nestedString(row, ["repository", "full_name"])
+    ?? nestedString(row, ["repository", "nameWithOwner"])
+    ?? formatNestedRepository(row["repository"]);
+  const commit = stringField(row, "sha")
+    ?? stringField(row, "hash")
+    ?? stringField(row, "commit")
+    ?? stringField(row, "commitId")
+    ?? nestedString(row, ["commit", "hash"])
+    ?? nestedString(row, ["commit", "id"]);
+  const url = stringField(row, "url")
+    ?? stringField(row, "html_url")
+    ?? nestedString(row, ["links", "self", 0, "href"])
+    ?? nestedString(row, ["links", "html", "href"]);
+  const match = stringField(row, "match")
+    ?? stringField(row, "fragment")
+    ?? stringField(row, "content")
+    ?? nestedString(row, ["text_matches", 0, "fragment"])
+    ?? nestedString(row, ["textMatches", 0, "fragment"])
+    ?? nestedString(row, ["hitContexts", 0, "text"])
+    ?? nestedString(row, ["matches", 0, "fragment"])
+    ?? nestedString(row, ["matches", 0, "text"]);
+  return {
+    path: path ?? "",
+    repo,
+    commit,
+    url,
+    match,
+  };
+}
+
+function normalizeOneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function joinPathComponents(value: unknown): string | undefined {
+  const record = asRecord(value);
+  const components = record.components;
+  if (!Array.isArray(components)) return undefined;
+  const parts = components.filter((part): part is string => typeof part === "string" && part.length > 0);
+  return parts.length ? parts.join("/") : undefined;
+}
+
+function formatNestedRepository(value: unknown): string | undefined {
+  const repo = asRecord(value);
+  const project = nestedString(repo, ["project", "key"]) ?? nestedString(repo, ["project", "name"]) ?? stringField(repo, "project");
+  const slug = stringField(repo, "slug") ?? stringField(repo, "name");
+  return project && slug ? `${project}/${slug}` : undefined;
+}
+
+function firstNonEmptyArray(...values: unknown[][]): unknown[] {
+  return values.find((value) => value.length > 0) ?? [];
 }
 
 function parseSshRemote(value: string, fallbackBaseUrl?: string): BitbucketRepoRef | undefined {

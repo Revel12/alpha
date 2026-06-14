@@ -102,6 +102,18 @@ export async function readOpenDocumentText(uri: vscode.Uri, maxBytes: number): P
 export async function writeText(uri: vscode.Uri, text: string): Promise<void> {
   ensureInsideWorkspace(uri);
   await ensureParentDirectory(uri);
+  const open = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
+  if (open) {
+    if (open.isDirty) {
+      throw new Error(`Refusing to write ${relativePath(uri)} because it has unsaved editor changes. Save or revert the file, then retry.`);
+    }
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(uri, fullDocumentRange(open), text);
+    const ok = await vscode.workspace.applyEdit(edit);
+    if (!ok) throw new Error(`VS Code rejected the workspace edit for ${relativePath(uri)}.`);
+    await open.save();
+    return;
+  }
   await vscode.workspace.fs.writeFile(uri, Buffer.from(text, "utf8"));
 }
 
@@ -151,6 +163,11 @@ function truncateText(text: string, maxBytes: number): string {
   const bytes = Buffer.from(text, "utf8");
   if (bytes.byteLength <= maxBytes) return text;
   return Buffer.from(bytes.subarray(0, maxBytes)).toString("utf8") + "\n...[truncated]";
+}
+
+function fullDocumentRange(document: vscode.TextDocument): vscode.Range {
+  const lastLine = Math.max(0, document.lineCount - 1);
+  return new vscode.Range(new vscode.Position(0, 0), document.lineAt(lastLine).rangeIncludingLineBreak.end);
 }
 
 function normalizeWorkspaceSuffix(input: string): string {

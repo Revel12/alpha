@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import {
   InMemoryArtifactStore,
   InMemoryBashJobStore,
+  InMemoryConflictStore,
   InMemoryDiscoveredToolStore,
   InMemoryFileSnapshotStore,
   InMemoryPendingEditStore,
@@ -16,11 +17,13 @@ import type {
   ArtifactStore,
   BashJob,
   BashJobStore,
+  ConflictStore,
   DiscoveredToolStore,
   FileSnapshot,
   FileSnapshotStore,
   PendingEdit,
   PendingEditStore,
+  PlanModeState,
   PermissionDecisionStore,
   TodoItem,
   TodoPhase,
@@ -38,13 +41,16 @@ export interface AlphaSessionState {
   createdAt: string;
   updatedAt: string;
   compactionSummary?: string;
+  compactedThroughHistoryIndex?: number;
   pendingEdits: PendingEditStore;
   todos: TodoStore;
   snapshots: FileSnapshotStore;
   artifacts: ArtifactStore;
   bashJobs: BashJobStore;
+  conflicts: ConflictStore;
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
+  planMode?: PlanModeState;
 }
 
 export class AlphaSessionManager {
@@ -91,6 +97,7 @@ export class AlphaSessionManager {
       state.snapshots.clear();
       state.artifacts.clear();
       state.bashJobs.clear();
+      state.conflicts.clear();
       state.permissionDecisions.clear();
       state.discoveredTools.clear();
     }
@@ -151,13 +158,16 @@ function createSessionState(
     createdAt: persisted?.createdAt ?? new Date().toISOString(),
     updatedAt: persisted?.updatedAt ?? new Date().toISOString(),
     compactionSummary: persisted?.compactionSummary,
+    compactedThroughHistoryIndex: persisted?.compactedThroughHistoryIndex,
     pendingEdits: new InMemoryPendingEditStore((persisted?.pendingEdits ?? []).map(fromPersistedPendingEdit), notifyChanged),
     todos: new InMemoryTodoStore(persisted?.todos ?? [], notifyChanged),
     snapshots: new InMemoryFileSnapshotStore(persisted?.snapshots ?? [], notifyChanged),
     artifacts: new InMemoryArtifactStore((persisted?.artifacts ?? []).map(fromPersistedArtifact), notifyChanged, artifactDir),
     bashJobs: new InMemoryBashJobStore(persisted?.bashJobs ?? [], notifyChanged),
+    conflicts: new InMemoryConflictStore([], notifyChanged),
     permissionDecisions: new InMemoryPermissionDecisionStore(),
     discoveredTools: new InMemoryDiscoveredToolStore(persisted?.discoveredTools ?? [], notifyChanged),
+    planMode: persisted?.planMode,
   };
   return state;
 }
@@ -169,12 +179,14 @@ function toPersistedSession(state: AlphaSessionState): PersistedSession {
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
     compactionSummary: state.compactionSummary,
+    compactedThroughHistoryIndex: state.compactedThroughHistoryIndex,
     pendingEdits: state.pendingEdits.list().map(toPersistedPendingEdit),
     todos: state.todos.list(),
     snapshots: state.snapshots.list(),
     artifacts: state.artifacts.list().map(toPersistedArtifact),
     bashJobs: state.bashJobs.list().map(toPersistedBashJob),
     discoveredTools: state.discoveredTools.list(),
+    planMode: state.planMode,
   };
 }
 
@@ -231,12 +243,14 @@ interface PersistedSession {
   createdAt: string;
   updatedAt: string;
   compactionSummary?: string;
+  compactedThroughHistoryIndex?: number;
   pendingEdits?: PersistedPendingEdit[];
   todos?: TodoPhase[] | TodoItem[];
   snapshots?: FileSnapshot[];
   artifacts?: PersistedArtifact[];
   bashJobs?: BashJob[];
   discoveredTools?: string[];
+  planMode?: PlanModeState;
 }
 
 interface PersistedArtifact {

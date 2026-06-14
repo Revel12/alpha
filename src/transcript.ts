@@ -13,6 +13,7 @@ export interface AlphaTranscriptEntry {
 
 export interface BuildAlphaTranscriptOptions {
   compactionSummary?: string;
+  compactedThroughHistoryIndex?: number;
 }
 
 export function buildAlphaTranscript(
@@ -30,6 +31,7 @@ export function buildAlphaTranscript(
   }
 
   history.forEach((turn, historyIndex) => {
+    if (options.compactedThroughHistoryIndex !== undefined && historyIndex <= options.compactedThroughHistoryIndex) return;
     if (isChatRequestTurn(turn)) {
       const content = turn.prompt.trim();
       if (!content) return;

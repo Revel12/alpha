@@ -25,7 +25,33 @@
         "id": "alpha.participant",
         "name": "a",
         "fullName": "Alpha",
-        "description": "OMP-style local coding harness with read/bash/edit/search/find/web_search/write/lsp/bitbucket/task/eval/todo tools."
+        "description": "OMP-style local coding harness with read/bash/edit/search/find/web_search/write/lsp/bitbucket/task/eval/todo tools.",
+        "commands": [
+          {
+            "name": "review",
+            "description": "Review code changes with Alpha reviewer agents."
+          },
+          {
+            "name": "commit",
+            "description": "Create OMP-style atomic git commits from current changes."
+          },
+          {
+            "name": "plan",
+            "description": "Enter OMP-style read-only plan mode before implementation."
+          },
+          {
+            "name": "plan-review",
+            "description": "Show the current Alpha plan mode review state."
+          },
+          {
+            "name": "compact",
+            "description": "Compact Alpha chat history into a persistent summary."
+          },
+          {
+            "name": "context",
+            "description": "Show Alpha prompt token usage for the current Copilot model."
+          }
+        ]
       }
     ],
     "commands": [
@@ -136,6 +162,11 @@
           "default": true,
           "description": "Include VS Code diagnostics for a file after write."
         },
+        "alpha.edit.diagnosticsOnEdit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include VS Code diagnostics for touched files after edit."
+        },
         "alpha.session.maxHistoryTurns": {
           "type": "number",
           "default": 30,
@@ -149,6 +180,48 @@
           "minimum": 1,
           "maximum": 365,
           "description": "Automatically prune persisted Alpha sessions that have not been touched for this many days."
+        },
+        "alpha.context.showUsage": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show Alpha outgoing prompt token usage at the start of each response."
+        },
+        "alpha.context.autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically compact Alpha chat history when outgoing prompt usage crosses the configured threshold."
+        },
+        "alpha.context.compactionThresholdPercent": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "OMP-style Alpha-side compaction threshold as a percentage of the current VS Code Copilot model max input tokens."
+        },
+        "alpha.context.compactionThresholdTokens": {
+          "type": "number",
+          "default": -1,
+          "minimum": -1,
+          "description": "Fixed Alpha-side compaction token threshold. Set -1 to use alpha.context.compactionThresholdPercent."
+        },
+        "alpha.context.targetPercent": {
+          "type": "number",
+          "default": 90,
+          "minimum": 10,
+          "maximum": 100,
+          "description": "After compaction, drop oldest replayed chat turns until Alpha's outgoing prompt is below this percentage of the current model input window."
+        },
+        "alpha.context.midTurnAutoCompact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run OMP-style in-flight compaction during long tool loops after completed tool exchanges push context above the compaction threshold."
+        },
+        "alpha.context.midTurnKeepRecentTokens": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "maximum": 200000,
+          "description": "Recent in-flight tool-loop token budget kept verbatim when Alpha compacts older completed tool exchanges. Mirrors OMP's token-oriented keepRecentTokens shape."
         },
         "alpha.tools.discoveryMode": {
           "type": "string",
@@ -182,6 +255,20 @@
           },
           "description": "Per-tool OMP-style approval policy overrides, keyed by tool name, with values allow, deny, or prompt."
         },
+        "alpha.tools.maxRequests": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum model requests Alpha may make during one main @a turn before forcing a final no-tool response."
+        },
+        "alpha.tools.maxRepeatedToolBatches": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum identical consecutive tool-call batches allowed before Alpha stops the loop and asks the model to answer without tools."
+        },
         "alpha.bitbucket.baseUrl": {
           "type": "string",
           "default": "",
@@ -201,6 +288,14 @@
           "type": "string",
           "default": "BITBUCKET_PASSWORD",
           "description": "Environment variable containing a Bitbucket password or app password for basic auth."
+        },
+        "alpha.bitbucket.codeSearchPathTemplates": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional Bitbucket Server/Data Center code-search endpoint templates. Templates may be absolute URLs or base-url-relative paths and may use {baseUrl}, {project}, {workspace}, {slug}, {repo}, {query}, and {limit}. Alpha tries these before built-in Server/Data Center defaults."
         },
         "alpha.task.batch": {
           "type": "boolean",
@@ -230,6 +325,13 @@
           "default": 5000,
           "minimum": 100,
           "description": "Maximum visible lines from one subagent result before full output is stored as an artifact."
+        },
+        "alpha.task.softRequestBudgetOverride": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 500,
+          "description": "Override OMP-style soft subagent request budgets. 0 uses built-in defaults: explore/quick_task 40, default 90."
         },
         "alpha.eval.js": {
           "type": "boolean",

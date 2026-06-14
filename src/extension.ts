@@ -1,9 +1,16 @@
 import * as vscode from "vscode";
 import { applyWorkspaceEdits } from "./patch/hashline";
 import { AlphaSessionManager } from "./sessionState";
+import type { AlphaSessionState } from "./sessionState";
 import { buildAlphaTranscript } from "./transcript";
 import type { AlphaContext } from "./types";
-import { answerWithAlphaTools } from "./lmTools";
+import { alphaContextUsageForPrompt, answerWithAlphaTools } from "./lmTools";
+import { runAlphaCommit } from "./commitWorkflow";
+import { compactTranscriptWithModel, compactableTranscriptEntries, formatContextUsage } from "./contextManager";
+import { resolveInternalUrl } from "./internalUrls";
+import { createPlanModeState, renderPlanModeStatus, renderPlanReview } from "./planMode";
+import { buildInteractiveReviewPrompt } from "./reviewCore";
+import { workspaceRoot } from "./workspace";
 
 let sessions: AlphaSessionManager;
 
@@ -105,14 +112,18 @@ async function handleAlphaRequest(
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
-  const prompt = request.prompt.trim();
+  const parsedRequest = parseAlphaChatRequest(request);
   const session = sessions.get(chatContext, request);
-  const transcript = buildAlphaTranscript(chatContext.history, { compactionSummary: session.compactionSummary });
+  const transcript = buildAlphaTranscript(chatContext.history, {
+    compactionSummary: session.compactionSummary,
+    compactedThroughHistoryIndex: session.compactedThroughHistoryIndex,
+  });
   const alphaContext: AlphaContext = {
     extensionContext,
     sessionKey: session.key,
     sessionLabel: session.label,
     compactionSummary: session.compactionSummary,
+    compactedThroughHistoryIndex: session.compactedThroughHistoryIndex,
     request,
     chatContext,
     transcript,
@@ -123,19 +134,296 @@ async function handleAlphaRequest(
     snapshots: session.snapshots,
     artifacts: session.artifacts,
     bashJobs: session.bashJobs,
+    conflicts: session.conflicts,
     permissionDecisions: session.permissionDecisions,
     discoveredTools: session.discoveredTools,
+    planMode: session.planMode,
+    persistSession: () => sessions.persistNow(),
+    setCompaction: (summary, compactedThroughHistoryIndex) => {
+      session.compactionSummary = summary;
+      session.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
+      alphaContext.compactionSummary = summary;
+      alphaContext.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
+      sessions.persistNow();
+    },
   };
 
   try {
-    if (!prompt || prompt === "help") {
+    if (!parsedRequest.command && (!parsedRequest.prompt || parsedRequest.prompt === "help")) {
       stream.markdown("Alpha is an OMP-style VS Code chat participant. Invoke it with `@a` and ask naturally, e.g. `read src/foo.ts and explain it` or `search for TODO comments`.");
       return;
     }
 
-    await answerWithAlphaTools(prompt, alphaContext);
+    if (parsedRequest.command === "commit") {
+      await runAlphaCommit(parsedRequest.prompt, alphaContext);
+      return;
+    }
+
+    if (parsedRequest.command === "context") {
+      const usage = await alphaContextUsageForPrompt(parsedRequest.prompt || "context usage", alphaContext);
+      stream.markdown([
+        `Alpha context usage: ${formatContextUsage(usage)}`,
+        "",
+        `Model: ${request.model.name}`,
+        `Max input tokens: ${usage.maxInputTokens.toLocaleString()}`,
+        `Compacted through history index: ${session.compactedThroughHistoryIndex ?? "none"}`,
+        session.compactionSummary ? "Compaction summary: present" : "Compaction summary: none",
+      ].join("\n"));
+      return;
+    }
+
+    if (parsedRequest.command === "compact") {
+      await compactAlphaSession(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
+    if (parsedRequest.command === "plan") {
+      await handlePlanCommand(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
+    if (parsedRequest.command === "plan-review") {
+      await handlePlanReviewCommand(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
+    if (!parsedRequest.command && session.planMode && (session.planMode.pendingApproval || session.planMode.approvedPlan)) {
+      const handled = await handlePlanDecisionPrompt(parsedRequest.prompt, session, alphaContext);
+      if (handled) return;
+    }
+
+    const expandedPrompt = await expandAlphaCommand(parsedRequest);
+    if (expandedPrompt === undefined) return;
+    await answerWithAlphaTools(expandedPrompt, alphaContext);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stream.markdown(`Alpha error: ${message}`);
   }
+}
+
+async function compactAlphaSession(
+  note: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  const compactable = compactableTranscriptEntries(ctx.transcript);
+  const lastHistoryIndex = compactable.at(-1)?.historyIndex;
+  if (lastHistoryIndex === undefined) {
+    ctx.stream.markdown("No Alpha chat history is available to compact.");
+    return;
+  }
+  const usage = await alphaContextUsageForPrompt(note || "compact current Alpha session", ctx);
+  const result = await compactTranscriptWithModel({
+    model: ctx.request.model,
+    token: ctx.token,
+    sessionLabel: ctx.sessionLabel,
+    sessionKey: ctx.sessionKey,
+    transcript: compactable,
+    existingSummary: ctx.compactionSummary,
+    throughHistoryIndex: lastHistoryIndex,
+    tokensBefore: usage.inputTokens,
+  });
+  session.compactionSummary = result.summary;
+  session.compactedThroughHistoryIndex = result.compactedThroughHistoryIndex;
+  ctx.compactionSummary = result.summary;
+  ctx.compactedThroughHistoryIndex = result.compactedThroughHistoryIndex;
+  sessions.persistNow();
+  ctx.stream.markdown([
+    "Alpha compaction complete.",
+    "",
+    `Compacted through history index: ${result.compactedThroughHistoryIndex}`,
+    `Tokens before: ${result.tokensBefore.toLocaleString()}`,
+    "",
+    result.summary,
+  ].join("\n"));
+}
+
+async function handlePlanReviewCommand(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  const state = session.planMode;
+  if (!state) {
+    ctx.stream.markdown("No Alpha plan is available in this chat session.");
+    return;
+  }
+
+  const planPath = state.approvedPlanPath ?? state.planPath;
+  let plan = state.approvedPlan;
+  if (!plan) {
+    try {
+      plan = (await resolveInternalUrl(planPath, ctx)).content;
+    } catch {
+      ctx.stream.markdown("No plan to review yet. Ask Alpha to write one to `local://alpha-plan.md` first.");
+      return;
+    }
+  }
+
+  const contextUsage = await alphaContextUsageForPrompt("plan review", ctx);
+  if (!state.active && state.approvedPlan && !state.pendingApproval) {
+    ctx.stream.markdown([
+      renderPlanReview(state),
+      "",
+      `Current context: ${formatContextUsage(contextUsage)}`,
+      "",
+      "This plan is not waiting for approval. Type `approve and implement` to retry it, `refine: <what to change>` to revise it, or `discard plan` to clear it.",
+    ].join("\n"));
+    return;
+  }
+
+  state.approvedPlan = plan;
+  state.approvedPlanPath = planPath;
+  state.planPath = planPath;
+  state.pendingApproval = true;
+  state.updatedAt = new Date().toISOString();
+  ctx.planMode = state;
+  sessions.persistNow();
+  ctx.stream.markdown(`${renderPlanReview(state)}\n\nCurrent context: ${formatContextUsage(contextUsage)}\n\nType one of:\n- \`approve and implement\`\n- \`refine: <what to change>\`\n- \`discard plan\``);
+}
+
+async function handlePlanDecisionPrompt(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<boolean> {
+  const state = session.planMode;
+  if (!state || (!state.pendingApproval && !state.approvedPlan)) return false;
+
+  if (isPlanDiscardPrompt(prompt)) {
+    session.planMode = undefined;
+    ctx.planMode = undefined;
+    sessions.persistNow();
+    ctx.stream.markdown("Discarded Alpha plan.");
+    return true;
+  }
+
+  if (isPlanRefinePrompt(prompt)) {
+    state.active = true;
+    state.pendingApproval = false;
+    state.updatedAt = new Date().toISOString();
+    ctx.planMode = state;
+    sessions.persistNow();
+
+    const refinement = prompt.replace(/^\s*(refine|revise|change|update|modify)(\s+plan)?\s*[:,-]?\s*/i, "").trim();
+    if (!refinement) {
+      ctx.stream.markdown(`${renderPlanReview(state)}\n\nTell me what to change in the plan.`);
+      return true;
+    }
+
+    ctx.stream.markdown(`${renderPlanReview(state)}\n\nRefining the plan from your instructions.\n\n`);
+    await answerWithAlphaTools(`Refine the pending Alpha plan with this user instruction: ${refinement}`, ctx);
+    return true;
+  }
+
+  if (isPlanApprovalPrompt(prompt)) {
+    await approvePlanAndExecute(prompt, session, ctx);
+    return true;
+  }
+
+  return false;
+}
+
+async function approvePlanAndExecute(
+  userApprovalMessage: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  const state = session.planMode;
+  if (!state) {
+    ctx.stream.markdown("No active Alpha plan is waiting for approval.");
+    return;
+  }
+  if (!state.active && !state.approvedPlan) {
+    ctx.stream.markdown("No active or approved Alpha plan is waiting for implementation.");
+    return;
+  }
+
+  const approvedPlan = state.approvedPlan ?? (await resolveInternalUrl(state.approvedPlanPath ?? state.planPath, ctx)).content;
+  state.approvedPlan = approvedPlan;
+  state.approvedPlanPath = state.approvedPlanPath ?? state.planPath;
+  state.active = false;
+  state.pendingApproval = false;
+  state.updatedAt = new Date().toISOString();
+  ctx.planMode = state;
+  sessions.persistNow();
+
+  const executionPrompt = [
+    "The user explicitly approved the pending Alpha plan. Implement it now.",
+    `\nApproved plan:\n${approvedPlan}`,
+    userApprovalMessage ? `\nUser approval message:\n${userApprovalMessage}` : "",
+  ].join("\n");
+  await answerWithAlphaTools(executionPrompt, ctx);
+}
+
+function isPlanApprovalPrompt(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  if (/\b(cancel|discard|abandon|revise|refine|change|update|modify|not yet|don't|do not)\b/.test(text)) return false;
+  return /\b(approve|approved|apply|implement|execute|proceed|go ahead|start)\b/.test(text);
+}
+
+function isPlanRefinePrompt(prompt: string): boolean {
+  return /\b(refine|revise|change|update|modify)\b/i.test(prompt);
+}
+
+function isPlanDiscardPrompt(prompt: string): boolean {
+  return /\b(discard|cancel|abandon|drop)\b/i.test(prompt);
+}
+
+async function handlePlanCommand(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  if (session.planMode?.active) {
+    if (!prompt) {
+      session.planMode = undefined;
+      ctx.planMode = undefined;
+      sessions.persistNow();
+      ctx.stream.markdown("Exited Alpha plan mode without applying a plan.");
+      return;
+    }
+
+    ctx.stream.markdown(`${renderPlanModeStatus(session.planMode)}\n\n`);
+    await answerWithAlphaTools(prompt, ctx);
+    return;
+  }
+
+  session.planMode = createPlanModeState(prompt || undefined);
+  ctx.planMode = session.planMode;
+  sessions.persistNow();
+
+  if (!prompt) {
+    ctx.stream.markdown(`${renderPlanModeStatus(session.planMode)}\n\nSend \`@a /plan <goal>\` to start planning, or ask naturally in this chat while plan mode is active.`);
+    return;
+  }
+
+  await answerWithAlphaTools(prompt, ctx);
+}
+
+interface ParsedAlphaChatRequest {
+  command?: string;
+  prompt: string;
+}
+
+function parseAlphaChatRequest(request: vscode.ChatRequest): ParsedAlphaChatRequest {
+  const prompt = request.prompt.trim();
+  const command = request.command?.trim();
+  if (command) return { command, prompt };
+
+  const match = /^\/([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(prompt);
+  if (!match) return { prompt };
+
+  return {
+    command: match[1],
+    prompt: (match[2] ?? "").trim(),
+  };
+}
+
+async function expandAlphaCommand(request: ParsedAlphaChatRequest): Promise<string | undefined> {
+  if (!request.command) return request.prompt;
+  if (request.command !== "review") return `/${request.command}${request.prompt ? ` ${request.prompt}` : ""}`;
+  const expanded = await buildInteractiveReviewPrompt(request.prompt, workspaceRoot().fsPath);
+  if (!expanded) return undefined;
+  return expanded;
 }

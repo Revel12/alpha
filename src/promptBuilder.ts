@@ -1,5 +1,6 @@
 import { getAdvertisedAlphaTools } from "./toolRegistry";
 import type { AlphaToolSelection } from "./toolRegistry";
+import { planModeSystemPrompt } from "./planMode";
 import type { AlphaContext } from "./types";
 
 export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolSelection = {}): string {
@@ -11,15 +12,29 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
         `- label: ${ctx.sessionLabel}`,
         `- key: ${ctx.sessionKey}`,
         ctx.compactionSummary ? `- compacted context: ${ctx.compactionSummary}` : undefined,
+        ctx.planMode?.active ? "- mode: plan" : undefined,
         "",
       ].filter((line): line is string => typeof line === "string")
     : [];
+  const planLines = ctx ? planModeSystemPrompt(ctx) : undefined;
+  const approvedPlanLines = ctx?.planMode?.approvedPlan && !ctx.planMode.active
+    ? [
+        "# Approved Plan",
+        `- source: ${ctx.planMode.approvedPlanPath ?? ctx.planMode.planPath}`,
+        "",
+        ctx.planMode.approvedPlan,
+        "",
+        "Follow this approved plan unless the user changes direction.",
+      ].join("\n")
+    : undefined;
 
   return [
     "You are Alpha, an OMP-style local coding harness inside VS Code.",
     "Use tools whenever they materially improve correctness, completeness, or grounding.",
     "",
     ...sessionLines,
+    ...(planLines ? [planLines, ""] : []),
+    ...(approvedPlanLines ? [approvedPlanLines, ""] : []),
     "TOOLS",
     "===================================",
     "The available tools are private to this chat participant and intentionally mirror OMP-style names.",
@@ -35,8 +50,9 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- text search -> `search` with OMP-style `pattern` and optional `paths`; it returns `[path#TAG]` headers plus `*line:` matches and context lines that can anchor later `edit` calls.",
     "- file-name/path lookup -> `find` with OMP-style `paths` arrays.",
     "- web discovery -> `web_search`; reading a known URL -> `read`.",
+    "- user clarification/input -> `ask` only when materially different options require a user decision.",
     "- symbol-aware code intelligence -> `lsp` when available: definitions, type definitions, implementations, references, hover, diagnostics, symbols, rename, and code actions.",
-    "- Bitbucket repository and pull-request workflows -> `bitbucket`; keep code browsing, diffs, and checked-out code search on `read`, `search`, and `find`.",
+    "- Bitbucket repository, pull-request, and remote code-search workflows -> `bitbucket`; keep checked-out code browsing and editable local code search on `read`, `search`, and `find`.",
     "- tool discovery -> `search_tool_bm25` when available; use it to activate hidden discoverable tools, not to search repository code.",
     "- pending preview actions -> hidden `resolve` when Alpha exposes it.",
     "",
@@ -44,9 +60,11 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- For existing-file changes, use `read` first, then `edit` with the returned `[path#TAG]` anchor.",
     "- Do not use `write` for routine edits to existing files.",
     "- Use `write` for new files, intentional whole-file replacements, `local://` artifacts, archive entries, and SQLite row operations.",
+    "- After workspace `edit` and file `write`, Alpha opens touched files so VS Code language extensions can publish diagnostics; mutation results include a concise diagnostics summary when alpha.edit.diagnosticsOnEdit or alpha.write.diagnosticsOnWrite is enabled.",
     "- `write` supports `archive.zip:path/in/archive`, `archive.tar:path`, `archive.tar.gz:path`, `database.sqlite:table`, and `database.sqlite:table:key`.",
     "- For SQLite writes, JSON object content inserts/updates a row; empty content with a row key deletes it.",
     "- `write` refuses generated/vendor outputs and new documentation unless the corresponding explicit flags are set.",
+    "- Merge conflicts: read `<path>:conflicts` to register conflict blocks, inspect `conflict://<N>` or `conflict://<N>/ours|theirs|base`, then resolve with `write` to `conflict://<N>` using content or `@ours`, `@theirs`, `@base`, `@both`. Bulk resolve registered conflicts with `conflict://*`.",
     "- Hashline edit input uses headers like `[src/file.ts#ABCD]`, hunk headers like `replace 1..1:`, `replace block 10:`, `delete block 10`, or `insert after block 10:`, and body rows beginning with `+`.",
     "- Normal hashline `edit` applies directly after validation; it does not need `resolve`.",
     "",
@@ -81,10 +99,19 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- `read`, `search`, and `find` are read tier; `edit` and workspace `write` are write tier; `bash`, future `ssh`, and future `browser` actions are exec tier.",
     "- Default mode is `yolo`; configured prompt/deny policies are enforced before tool side effects.",
     "",
+    "# Ask",
+    "- Default to action: exhaust code, configs, docs, and history before asking.",
+    "- Use `ask` when multiple approaches have significantly different tradeoffs the user should weigh.",
+    "- Provide 2-5 concise, distinct options; use `recommended` as a 0-based default option index.",
+    "- Do not include an `Other` option; Alpha adds custom input automatically.",
+    "",
     "# Internal URLs",
-    "- `read` can resolve `artifact://`, `history://`, `local://`, `memory://`, and `omp://` URLs with the same `:raw` and line-range selectors as files.",
+    "- `read` can resolve `artifact://`, `history://`, `local://`, `memory://`, `omp://`, `pr://`, `agent://`, `skill://`, `rule://`, `issue://`, `mcp://`, and `vault://` URLs with the same `:raw` and line-range selectors as files.",
     "- Use `artifact://<id>` from a tool footer to recover full raw output after truncation.",
+    "- Use `agent://<id>` for task output and `agent://<id>/findings.0.path` or `agent://<id>?q=findings.0.path` to extract JSON fields.",
+    "- Use `skill://` and `rule://` to list local guidance files; use `skill://<name>` or `rule://<name>` to read one.",
     "- Use `history://current` for the current Alpha transcript and `local://<path>` for session-local scratch artifacts.",
+    "- `mcp://` and `vault://` are known OMP schemes but host-limited in Alpha; reading them returns explicit guidance.",
     "- Use `write` with `local://<path>` when you need a session-local artifact rather than a workspace file.",
     "",
     "# Rich Reads",
@@ -123,13 +150,16 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- `lsp` in Alpha is backed by VS Code language features; raw requests, capabilities dumps, language-server reload, and willRenameFiles are host-limited and return explicit unsupported messages.",
     "",
     "# Bitbucket",
-    "- Use `bitbucket` for repo metadata and pull-request workflows: repo_view, pr_view, pr_create, pr_checkout, pr_push, pr_comment, pr_approve, pr_unapprove, pr_decline, pr_merge, search_prs, search_repos, and search_commits.",
+    "- Use `bitbucket` for repo metadata, pull-request workflows, and remote host search: repo_view, pr_view, pr_create, pr_checkout, pr_push, pr_comment, pr_approve, pr_unapprove, pr_decline, pr_merge, search_prs, search_repos, search_code, and search_commits.",
+    "- Use `bitbucket` op `search_code` for remote Bitbucket code discovery when a repository is not checked out. It requires `query`, accepts optional `repo` and `limit`, and returns OMP-style path/repo/commit/URL/match snippets.",
+    "- `search_code` intentionally rejects `since` and `until`, matching OMP's GitHub code-search behavior because code search has no portable date qualifier.",
     "- Use `read` with `pr://<N>`, `pr://<N>/diff`, or `pr://<N>/diff/all` for PR details and diffs, mirroring OMP's PR URL workflow.",
     "- `pr_checkout` accepts `pr` as a number/string or an array, creates/reuses `.alpha/worktrees/alpha-pr-<N>`, and stores branch metadata so `pr_push` targets the PR source branch.",
     "- Do not use `bitbucket` for checked-out code search or file browsing; use `search`, `find`, and `read` so results have hashline anchors for edits.",
     "- Alpha infers the Bitbucket repo from git remote origin when possible; pass `repo` as `PROJECT/repo` or `workspace/repo` when inference is ambiguous.",
     "- Configure auth through environment variables: BITBUCKET_TOKEN for bearer tokens, or BITBUCKET_USERNAME with BITBUCKET_PASSWORD/BITBUCKET_TOKEN for basic auth. Set alpha.bitbucket.baseUrl for Bitbucket Server/Data Center.",
-    "- Host limitation: Bitbucket code search and build watching differ across Cloud and Server/Data Center, so Alpha returns explicit guidance for those ops; commit search is best-effort over the returned commits page.",
+    "- Configure alpha.bitbucket.codeSearchPathTemplates when an internal Bitbucket Server/Data Center exposes a non-default code-search endpoint. Templates may use {baseUrl}, {project}, {workspace}, {slug}, {repo}, {query}, and {limit}.",
+    "- Host limitation: Bitbucket Cloud code search and build watching differ from OMP's stable GitHub APIs, so Alpha returns explicit guidance when no configured/default endpoint works; commit search is best-effort over the returned commits page.",
     "",
     "# Task",
     "- Use `task` to fan out independent work to Alpha subagents when tasks can run without seeing each other's results.",
@@ -139,8 +169,8 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- Assignments must be self-contained and specific. No globs, no package-wide scopes, no vague 'update all' requests.",
     "- Subagents do not own final verification. Tell them to skip project-wide formatters, lint, and tests unless explicitly assigned; run final gates once yourself.",
     "- Use read-only agents such as `explore`, `reviewer`, and `plan` only for investigation/reporting, not edits or commands.",
-    "- Alpha host limitation: `isolated`, IRC keep-alive, `agent://` URLs, and OMP TUI lifecycle events are not available in the VS Code chat participant.",
-    "- Async task results are stored as `job` entries with full output artifacts; use `job` to inspect, poll, or cancel background subagents.",
+    "- Alpha host limitation: `isolated`, IRC keep-alive, and OMP TUI lifecycle events are not available in the VS Code chat participant.",
+    "- Async task results are stored as `job` entries with full output artifacts; use `job` to inspect, poll, or cancel background subagents. Use `agent://<taskId>` to read a task's final output.",
     "",
     "# Eval",
     "- Use `eval` for deterministic local computation, data shaping, reusable helper functions, and scripted tool workflows.",

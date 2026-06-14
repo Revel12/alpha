@@ -132,10 +132,70 @@ const BUILTIN_AGENTS: readonly AgentDefinition[] = [
     name: "reviewer",
     description: "Review agent focused on bugs, regressions, risks, and missing tests",
     systemPrompt: [
-      BUILTIN_AGENT_PROMPT,
-      "Review from a code-review stance. Lead with actionable findings and file/line references.",
+      "Identify bugs the author would want fixed before merge.",
+      "",
+      "<procedure>",
+      "1. Run `git diff`, `jj diff --git`, or host-provided diff instructions to view the patch",
+      "2. Read modified files for full context",
+      "3. Call `report_finding` per issue",
+      "4. Call `yield` with verdict",
+      "",
+      "Bash is read-only: `git diff`, `git log`, `git show`, `jj diff --git`, and similar diff inspection commands. You NEVER make file edits or trigger builds.",
+      "</procedure>",
+      "",
+      "<criteria>",
+      "Report issue only when ALL conditions hold:",
+      "- Provable impact: show specific affected code paths, no speculation",
+      "- Actionable: discrete fix, not vague advice",
+      "- Unintentional: clearly not a deliberate design choice",
+      "- Introduced in patch: do not flag pre-existing bugs",
+      "- No unstated assumptions about codebase or author intent",
+      "- Proportionate rigor: fix does not demand rigor absent elsewhere in codebase",
+      "</criteria>",
+      "",
+      "<cross-boundary>",
+      "For every new type, variant, or value introduced by the patch that crosses a function or module boundary, locate the consuming dispatch point and confirm the new value is routed explicitly or by a correct catch-all. Report silent drops, no-ops, or discarded values as defects.",
+      "</cross-boundary>",
+      "",
+      "<priority>",
+      "|Level|Criteria|Example|",
+      "|---|---|---|",
+      "|P0|Blocks release/operations; universal, no input assumptions|Data corruption, auth bypass|",
+      "|P1|High; fix next cycle|Race condition under load|",
+      "|P2|Medium; fix eventually|Edge case mishandling|",
+      "|P3|Info; nice to have|Suboptimal but correct|",
+      "</priority>",
+      "",
+      "<output>",
+      "Each `report_finding` requires title, body, priority P0-P3, confidence 0.0-1.0, file_path, line_start, and line_end. Ranges must overlap the diff and be at most 10 lines.",
+      "Final `yield` data must include: overall_correctness ('correct' or 'incorrect'), explanation (1-3 sentences), and confidence (0.0-1.0). Do not include findings manually; Alpha auto-injects them from report_finding.",
+      "Correctness ignores non-blocking issues such as style, docs, and nits.",
+      "</output>",
     ].join("\n\n"),
-    tools: ["read", "search", "find", "lsp", "todo"],
+    tools: ["read", "search", "find", "bash", "lsp", "web_search", "report_finding", "yield"],
+    output: {
+      properties: {
+        overall_correctness: { enum: ["correct", "incorrect"] },
+        explanation: { type: "string" },
+        confidence: { type: "number" },
+      },
+      optionalProperties: {
+        findings: {
+          elements: {
+            properties: {
+              title: { type: "string" },
+              body: { type: "string" },
+              priority: { type: "number" },
+              confidence: { type: "number" },
+              file_path: { type: "string" },
+              line_start: { type: "number" },
+              line_end: { type: "number" },
+            },
+          },
+        },
+      },
+    },
+    blocking: true,
     source: "bundled",
   },
   {
@@ -295,7 +355,7 @@ export function getAgent(agents: AgentDefinition[], name: string): AgentDefiniti
 }
 
 export function isReadOnlyAgent(agent: AgentDefinition): boolean {
-  const readOnlyTools = new Set(["read", "search", "find", "lsp", "web_search", "todo", "job", "recall", "reflect", "retain", "render_mermaid", "inspect_image", "search_tool_bm25"]);
+  const readOnlyTools = new Set(["read", "search", "find", "lsp", "web_search", "todo", "job", "recall", "reflect", "retain", "render_mermaid", "inspect_image", "search_tool_bm25", "report_finding", "yield"]);
   return !!agent.tools?.length && agent.tools.every((tool) => readOnlyTools.has(tool));
 }
 
@@ -313,7 +373,7 @@ export function renderTaskDescription(agents: AgentDefinition[], options: { asyn
     `Concurrency is bounded at ${options.maxConcurrency} running subagents per session.`,
     "Subagents have no conversation history; every fact, file path, and acceptance criterion must be explicit in context or assignment.",
     "Subagents must skip project-wide gates, formatters, and tests unless explicitly assigned.",
-    "Alpha host limitations: isolated git worktrees, IRC keep-alive, agent:// URLs, and raw OMP TUI lifecycle events are not available in the VS Code chat participant.",
+    "Alpha host limitations: isolated git worktrees, IRC keep-alive, mcp://, vault://, and raw OMP TUI lifecycle events are not available in the VS Code chat participant.",
     "<agents>",
     agentLines,
     "</agents>",

@@ -1,11 +1,15 @@
 import * as vscode from "vscode";
+import type { ConflictStore } from "./conflictCore";
 import type { AlphaTranscriptEntry } from "./transcript";
+
+export type { ConflictStore } from "./conflictCore";
 
 export interface AlphaContext {
   extensionContext: vscode.ExtensionContext;
   sessionKey: string;
   sessionLabel: string;
   compactionSummary?: string;
+  compactedThroughHistoryIndex?: number;
   request: vscode.ChatRequest;
   chatContext: vscode.ChatContext;
   transcript: AlphaTranscriptEntry[];
@@ -16,12 +20,17 @@ export interface AlphaContext {
   snapshots: FileSnapshotStore;
   artifacts: ArtifactStore;
   bashJobs: BashJobStore;
+  conflicts: ConflictStore;
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
+  planMode?: PlanModeState;
+  persistSession?: () => void;
+  setCompaction?: (summary: string, compactedThroughHistoryIndex: number) => void;
 }
 
 export interface ToolResult {
   markdown: string;
+  details?: unknown;
 }
 
 export interface ToolDefinition {
@@ -141,4 +150,15 @@ export interface DiscoveredToolStore {
   list(): string[];
   add(names: readonly string[]): string[];
   clear(): void;
+}
+
+export interface PlanModeState {
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+  planPath: string;
+  initialPrompt?: string;
+  approvedPlan?: string;
+  approvedPlanPath?: string;
+  pendingApproval?: boolean;
 }

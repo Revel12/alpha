@@ -1,5 +1,8 @@
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as vscode from "vscode";
+import { applyJsonPath } from "./jsonPath";
 import { renderTranscriptMarkdown } from "./transcript";
 import type { AlphaContext } from "./types";
 import { readText, resolveWorkspaceFile, stat } from "./workspace";
@@ -12,15 +15,16 @@ export interface InternalResource {
   size: number;
   sourcePath?: string;
   immutable: boolean;
-  kind: "artifact" | "history" | "local" | "memory" | "omp" | "pr";
+  kind: "artifact" | "history" | "local" | "memory" | "omp" | "pr" | "agent" | "skill" | "rule" | "issue" | "mcp" | "vault";
 }
 
 interface ParsedInternalUrl {
   scheme: InternalResource["kind"];
   path: string;
+  query: URLSearchParams;
 }
 
-const INTERNAL_SCHEMES = new Set(["artifact", "history", "local", "memory", "omp", "pr"]);
+const INTERNAL_SCHEMES = new Set(["artifact", "history", "local", "memory", "omp", "pr", "agent", "skill", "rule", "issue", "mcp", "vault"]);
 
 const OMP_DOCS: Record<string, string> = {
   "tools/read.md": [
@@ -35,6 +39,8 @@ const OMP_DOCS: Record<string, string> = {
     "- memory://root for local memory-summary shims",
     "- omp://docs and omp://tools/* for bundled parity notes",
     "- pr://<N> and pr://<N>/diff for Bitbucket pull request views",
+    "- agent://<id> and agent://<id>/<json.path> for Alpha task outputs",
+    "- skill://<name> and rule://<name> for local project/user guidance files",
   ].join("\n"),
   "tools/bash.md": [
     "# bash",
@@ -72,6 +78,8 @@ const OMP_DOCS: Record<string, string> = {
     "- memory://root reads .alpha/memory/memory_summary.md when present.",
     "- omp://docs lists bundled OMP parity notes.",
     "- pr://<N> reads Bitbucket PR metadata; pr://<N>/diff reads the unified diff.",
+    "- agent://<id> reads a task output; agent://<id>/findings.0.path extracts JSON fields.",
+    "- skill:// and rule:// list locally discoverable skills/rules.",
   ].join("\n"),
 };
 
@@ -95,9 +103,136 @@ export async function resolveInternalUrl(input: string, ctx: AlphaContext): Prom
       return resolveOmpUrl(parsed);
     case "pr":
       return resolvePrUrl(parsed, ctx);
+    case "agent":
+      return resolveAgentUrl(parsed, ctx);
+    case "skill":
+      return resolveNamedFileUrl(parsed, "skill");
+    case "rule":
+      return resolveNamedFileUrl(parsed, "rule");
+    case "issue":
+      return resolveUnsupportedKnownScheme(parsed, "Bitbucket/Jira issue URL reads are not configured in Alpha. Use the approved tracker or Bitbucket/Jira UI for issues.");
+    case "mcp":
+      return resolveUnsupportedKnownScheme(parsed, "mcp:// requires OMP's MCP runtime/host URI bridge, which is not exposed to this VS Code chat participant.");
+    case "vault":
+      return resolveUnsupportedKnownScheme(parsed, "vault:// requires OMP's vault backend. Alpha does not provide a vault store in the VS Code chat participant.");
   }
   const exhaustive: never = parsed.scheme;
   throw new Error(`Unsupported internal URL scheme: ${exhaustive}`);
+}
+
+function resolveAgentUrl(parsed: ParsedInternalUrl, ctx: AlphaContext): InternalResource {
+  const { id, extraction } = splitAgentPath(parsed.path);
+  if (!id) throw new Error("agent:// URL requires an output ID: agent://<id>");
+  const artifact = resolveAgentArtifact(id, ctx);
+  if (!artifact) {
+    const available = ctx.artifacts.list()
+      .map((item) => agentIdFromArtifactLabel(item.label))
+      .filter((item): item is string => Boolean(item));
+    throw new Error(`Agent output not found: agent://${id}. Available: ${available.length ? available.join(", ") : "none"}`);
+  }
+
+  let content = artifact.content;
+  let contentType: InternalResource["contentType"] = "text/markdown";
+  const queryExtraction = parsed.query.get("q") ?? undefined;
+  if (extraction && queryExtraction) {
+    throw new Error("agent:// URL cannot combine path extraction with ?q=");
+  }
+  const requestedExtraction = extraction || queryExtraction;
+  if (requestedExtraction) {
+    let json: unknown;
+    try {
+      json = JSON.parse(content);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`agent://${id} output is not valid JSON: ${message}`);
+    }
+    const extracted = applyJsonPath(json, requestedExtraction);
+    content = JSON.stringify(extracted ?? null, null, 2);
+    contentType = "application/json";
+  }
+
+  return {
+    url: requestedExtraction ? `agent://${id}/${requestedExtraction}` : `agent://${id}`,
+    label: `agent://${id}`,
+    content,
+    contentType,
+    size: Buffer.byteLength(content, "utf8"),
+    sourcePath: artifact.filePath,
+    immutable: true,
+    kind: "agent",
+  };
+}
+
+function splitAgentPath(input: string): { id: string; extraction?: string } {
+  const rel = stripSlashes(input);
+  const slash = rel.indexOf("/");
+  if (slash === -1) return { id: rel };
+  return {
+    id: rel.slice(0, slash),
+    extraction: rel.slice(slash + 1).replace(/^\/+/, ""),
+  };
+}
+
+function resolveAgentArtifact(id: string, ctx: AlphaContext) {
+  if (/^\d+$/.test(id)) return ctx.artifacts.get(id);
+  const artifact = ctx.artifacts.list().find((item) => agentIdFromArtifactLabel(item.label) === id);
+  return artifact ? ctx.artifacts.get(artifact.id) : undefined;
+}
+
+function agentIdFromArtifactLabel(label: string): string | undefined {
+  const match = /^task\s+(.+?)\s+output$/i.exec(label.trim());
+  return match?.[1];
+}
+
+async function resolveNamedFileUrl(parsed: ParsedInternalUrl, kind: "skill" | "rule"): Promise<InternalResource> {
+  const rel = stripSlashes(parsed.path);
+  const roots = kind === "skill" ? skillRoots() : ruleRoots();
+  if (!rel) {
+    const entries = await listNamedFiles(roots);
+    const content = entries.length
+      ? entries.map((entry) => `- ${kind}://${entry.name}${entry.detail ? ` (${entry.detail})` : ""}`).join("\n")
+      : `No ${kind}s found.`;
+    return {
+      url: `${kind}://`,
+      label: `${kind}://`,
+      content,
+      contentType: "text/markdown",
+      size: Buffer.byteLength(content, "utf8"),
+      immutable: true,
+      kind,
+    };
+  }
+
+  const file = await findNamedFile(kind, rel, roots);
+  if (!file) throw new Error(`${kind} not found: ${kind}://${rel}`);
+  const content = await fs.readFile(file.path, "utf8");
+  return {
+    url: `${kind}://${rel}`,
+    label: `${kind}://${rel}`,
+    content,
+    contentType: contentTypeForPath(file.path),
+    size: Buffer.byteLength(content, "utf8"),
+    sourcePath: file.path,
+    immutable: true,
+    kind,
+  };
+}
+
+function resolveUnsupportedKnownScheme(parsed: ParsedInternalUrl, message: string): InternalResource {
+  const content = [
+    `# ${parsed.scheme}://`,
+    "",
+    message,
+  ].join("\n");
+  return {
+    url: normalizeInternalUrl(parsed),
+    label: normalizeInternalUrl(parsed),
+    content,
+    contentType: "text/markdown",
+    size: Buffer.byteLength(content, "utf8"),
+    immutable: true,
+    kind: parsed.scheme,
+  };
 }
 
 async function resolvePrUrl(parsed: ParsedInternalUrl, ctx: AlphaContext): Promise<InternalResource> {
@@ -351,10 +486,16 @@ function tryParseInternalUrl(input: string): ParsedInternalUrl | undefined {
   const scheme = match[1].toLowerCase();
   if (!INTERNAL_SCHEMES.has(scheme)) return undefined;
 
-  const rawPath = match[2].split(/[?#]/, 1)[0] ?? "";
+  const rest = match[2] ?? "";
+  const queryStart = rest.indexOf("?");
+  const hashStart = rest.indexOf("#");
+  const end = [queryStart, hashStart].filter((value) => value >= 0).sort((a, b) => a - b)[0] ?? rest.length;
+  const rawPath = rest.slice(0, end);
+  const rawQuery = queryStart >= 0 ? rest.slice(queryStart + 1, hashStart >= 0 && hashStart > queryStart ? hashStart : undefined) : "";
   return {
     scheme: scheme as ParsedInternalUrl["scheme"],
     path: decodePath(rawPath),
+    query: new URLSearchParams(rawQuery),
   };
 }
 
@@ -398,4 +539,105 @@ function contentTypeForPath(filePath: string): InternalResource["contentType"] {
   if (ext === ".md" || ext === ".mdx") return "text/markdown";
   if (ext === ".json") return "application/json";
   return "text/plain";
+}
+
+function skillRoots(): string[] {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  return [
+    path.join(cwd, ".alpha", "skills"),
+    path.join(cwd, ".omp", "skills"),
+    path.join(cwd, ".codex", "skills"),
+    path.join(cwd, ".claude", "skills"),
+    path.join(os.homedir(), ".alpha", "skills"),
+    path.join(os.homedir(), ".omp", "skills"),
+    path.join(os.homedir(), ".codex", "skills"),
+  ];
+}
+
+function ruleRoots(): string[] {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  return [
+    path.join(cwd, ".alpha", "rules"),
+    path.join(cwd, ".omp", "rules"),
+    path.join(cwd, ".codex", "rules"),
+    cwd,
+    path.join(os.homedir(), ".alpha", "rules"),
+    path.join(os.homedir(), ".omp", "rules"),
+    path.join(os.homedir(), ".codex", "rules"),
+  ];
+}
+
+async function listNamedFiles(roots: string[]): Promise<Array<{ name: string; detail?: string }>> {
+  const out: Array<{ name: string; detail?: string }> = [];
+  const seen = new Set<string>();
+  for (const root of roots) {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(root);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(root, entry);
+      let fileStat;
+      try {
+        fileStat = await fs.stat(fullPath);
+      } catch {
+        continue;
+      }
+      const name = fileStat.isDirectory() ? entry : stripKnownExtension(entry);
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, detail: root });
+    }
+  }
+  return out.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function findNamedFile(kind: "skill" | "rule", input: string, roots: string[]): Promise<{ path: string } | undefined> {
+  const parts = splitSafeRelativePath(input, { allowEmpty: false });
+  const [name, ...rest] = parts;
+  for (const root of roots) {
+    const candidates = kind === "skill"
+      ? skillCandidates(root, name, rest)
+      : ruleCandidates(root, name, rest);
+    for (const candidate of candidates) {
+      try {
+        const fileStat = await fs.stat(candidate);
+        if (fileStat.isFile()) return { path: candidate };
+      } catch {
+        // Try the next candidate.
+      }
+    }
+  }
+  return undefined;
+}
+
+function skillCandidates(root: string, name: string, rest: string[]): string[] {
+  if (rest.length) return [path.join(root, name, ...rest)];
+  return [
+    path.join(root, name, "SKILL.md"),
+    path.join(root, name, "skill.md"),
+    path.join(root, `${name}.md`),
+  ];
+}
+
+function ruleCandidates(root: string, name: string, rest: string[]): string[] {
+  if (rest.length) return [path.join(root, name, ...rest)];
+  const candidates = [
+    path.join(root, `${name}.md`),
+    path.join(root, name),
+    path.join(root, name, "RULE.md"),
+    path.join(root, name, "rule.md"),
+  ];
+  const upper = name.toUpperCase();
+  if (upper === "AGENTS") candidates.push(path.join(root, "AGENTS.md"));
+  if (upper === "CLAUDE") candidates.push(path.join(root, "CLAUDE.md"));
+  if (upper === "GEMINI") candidates.push(path.join(root, "GEMINI.md"));
+  if (name === ".cursorrules" || name === "cursorrules") candidates.push(path.join(root, ".cursorrules"));
+  return candidates;
+}
+
+function stripKnownExtension(name: string): string {
+  return name.replace(/\.(?:md|mdx|txt|json)$/i, "");
 }

@@ -9,12 +9,14 @@ import { ensureToolPermission } from "../approval";
 import { bitbucketApproval, bitbucketApprovalDetails } from "../approvalCore";
 import {
   bitbucketApiUrl,
+  bitbucketCodeSearchUrls,
   bitbucketCommitsUrl,
   bitbucketPrPayload,
   bitbucketPrDiffUrl,
   bitbucketSearchReposUrl,
   buildCheckoutMetadata,
   applyBitbucketDateFilter,
+  formatBitbucketCodeSearchResults,
   formatBitbucketList,
   formatBitbucketPr,
   formatBitbucketRepo,
@@ -22,6 +24,7 @@ import {
   parseBitbucketInput,
   prIdentifiers,
   prNumber,
+  requireBitbucketCodeSearchQuery,
   resolveBitbucketAuth,
   resolveBitbucketRepo,
   unsupportedBitbucketOp,
@@ -67,7 +70,7 @@ export const bitbucketTool: ToolDefinition = {
       case "search_repos":
         return { markdown: formatBitbucketList("Bitbucket repositories", await bitbucketJson(options, "GET", bitbucketSearchReposUrl(options.repo, input.query, input.limit)), input.limit) };
       case "search_code":
-        return { markdown: unsupportedBitbucketOp("search_code", "use Alpha `search`/`find`/`read` for local checked-out code. This intentionally preserves Alpha's hashline editing workflow instead of returning uneditable remote snippets.") };
+        return { markdown: await searchCode(options, input) };
       case "search_commits":
         return { markdown: await searchCommits(options, input) };
       case "run_watch":
@@ -84,6 +87,7 @@ interface BitbucketToolOptions {
   repo: BitbucketRepoRef;
   authHeader?: string;
   cwd: string;
+  codeSearchPathTemplates: string[];
 }
 
 async function resolveOptions(input: BitbucketInput): Promise<BitbucketToolOptions> {
@@ -94,6 +98,7 @@ async function resolveOptions(input: BitbucketInput): Promise<BitbucketToolOptio
   const tokenEnv = config.get<string>("bitbucket.tokenEnv", "BITBUCKET_TOKEN");
   const usernameEnv = config.get<string>("bitbucket.usernameEnv", "BITBUCKET_USERNAME");
   const passwordEnv = config.get<string>("bitbucket.passwordEnv", "BITBUCKET_PASSWORD");
+  const codeSearchPathTemplates = normalizeStringArray(config.get<unknown>("bitbucket.codeSearchPathTemplates", []));
   return {
     repo: resolveBitbucketRepo(input, remote, baseUrl),
     authHeader: resolveBitbucketAuth({
@@ -103,6 +108,7 @@ async function resolveOptions(input: BitbucketInput): Promise<BitbucketToolOptio
       password: process.env[passwordEnv],
     }),
     cwd,
+    codeSearchPathTemplates,
   };
 }
 
@@ -149,6 +155,37 @@ async function searchPrs(options: BitbucketToolOptions, input: BitbucketInput): 
   if (!input.query || options.repo.kind === "cloud") return formatBitbucketList("Bitbucket pull requests", { values: dated }, input.limit);
   const needle = input.query.toLowerCase();
   return formatBitbucketList("Bitbucket pull requests", { values: dated.filter((item) => JSON.stringify(item).toLowerCase().includes(needle)) }, input.limit);
+}
+
+async function searchCode(options: BitbucketToolOptions, input: BitbucketInput): Promise<string> {
+  const query = requireBitbucketCodeSearchQuery(input);
+  const urls = bitbucketCodeSearchUrls(options.repo, input, options.codeSearchPathTemplates);
+  if (!urls.length) {
+    return unsupportedBitbucketOp(
+      "search_code",
+      "Bitbucket Cloud has no configured OMP-equivalent code-search endpoint in Alpha. Configure alpha.bitbucket.codeSearchPathTemplates, or check out the repo and use Alpha `search`/`find`/`read` for editable hashline results.",
+    );
+  }
+
+  const errors: string[] = [];
+  for (const url of urls) {
+    try {
+      const data = await bitbucketJson(options, "GET", url);
+      return formatBitbucketCodeSearchResults(options.repo, query, data, input.limit);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return unsupportedBitbucketOp(
+    "search_code",
+    [
+      "No Bitbucket code-search endpoint succeeded.",
+      "Set alpha.bitbucket.codeSearchPathTemplates to the internal Server/Data Center search path exposed in your VDI.",
+      "Templates may use {baseUrl}, {project}, {workspace}, {slug}, {repo}, {query}, and {limit}.",
+      errors.length ? `Last error: ${errors[errors.length - 1]}` : undefined,
+    ].filter(Boolean).join(" "),
+  );
 }
 
 async function checkoutPr(options: BitbucketToolOptions, input: BitbucketInput): Promise<string> {
@@ -308,6 +345,11 @@ function formatCommitList(values: unknown[], limit: number): string {
     lines.push(`- ${hash.slice(0, 12)} ${message}${author ? ` — ${author}` : ""}${date ? ` (${date})` : ""}`);
   }
   return lines.join("\n");
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
 
 export async function readBitbucketPrUrl(path: string, ctx: AlphaContext): Promise<{ url: string; label: string; content: string; contentType: "text/markdown" | "text/plain"; size: number }> {

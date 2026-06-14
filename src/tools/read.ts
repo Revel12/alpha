@@ -1,4 +1,12 @@
 import * as vscode from "vscode";
+import {
+  formatConflictSummary,
+  formatConflictWarning,
+  parseConflictUri,
+  registerConflicts,
+  renderConflictRegion,
+  scanConflictLines,
+} from "../conflictCore";
 import { renderAnchoredFileWithTag } from "../hash";
 import { isInternalUrlPath, resolveInternalUrl, type InternalResource } from "../internalUrls";
 import {
@@ -40,6 +48,14 @@ export const readTool: ToolDefinition = {
 
     if (target.path === "active" || target.path === "selection" || target.path === "active:selection") {
       return readActiveEditor(target, ctx);
+    }
+
+    const conflictUri = parseConflictUri(target.path);
+    if (conflictUri) {
+      if (conflictUri.id === "*") {
+        throw new Error("Reading `conflict://*` is not supported; wildcards are write-only. Use `<path>:conflicts` to list conflicts.");
+      }
+      return { markdown: renderRegisteredConflict(conflictUri.id, conflictUri.scope, ctx) };
     }
 
     if (isWebUrlPath(target.path)) {
@@ -95,12 +111,13 @@ export const readTool: ToolDefinition = {
     if (target.raw) return { markdown: renderRawContent(content, target.ranges) };
 
     const snapshot = ctx.snapshots.record(path, content);
-    if (target.conflicts) return { markdown: renderConflicts(path, content, snapshot.tag) };
-    if (target.summary || (!target.explicitSelector && !target.ranges?.length)) {
+    if (target.conflicts) return { markdown: renderConflicts(path, content, snapshot.tag, ctx) };
+    const hasConflictMarkers = content.includes("<<<<<<<") && content.includes(">>>>>>>");
+    if (!hasConflictMarkers && (target.summary || (!target.explicitSelector && !target.ranges?.length))) {
       const summary = structuralSummary(path, content);
       if (summary) return { markdown: [`[${path}#${snapshot.tag}]`, "```text", summary, "```"].join("\n") };
     }
-    return { markdown: renderContent(path, content, snapshot.tag, target.ranges, target.explicitSelector ? undefined : defaultLimit) };
+    return { markdown: renderContent(path, content, snapshot.tag, target.ranges, target.explicitSelector ? undefined : defaultLimit, ctx) };
   },
 };
 
@@ -200,15 +217,16 @@ async function readActiveEditor(target: ReadTarget, ctx: AlphaContext): Promise<
     return { markdown: renderAnchoredFileWithTag(path, content, tag, startLine) };
   }
 
-  if (target.conflicts) return { markdown: renderConflicts(path, fullText, tag) };
+  if (target.conflicts) return { markdown: renderConflicts(path, fullText, tag, ctx) };
   if (target.raw) return { markdown: renderRawContent(fullText, target.ranges) };
 
-  if (target.summary || (!target.explicitSelector && !target.ranges?.length)) {
+  const hasConflictMarkers = fullText.includes("<<<<<<<") && fullText.includes(">>>>>>>");
+  if (!hasConflictMarkers && (target.summary || (!target.explicitSelector && !target.ranges?.length))) {
     const summary = structuralSummary(path, fullText);
     if (summary) return { markdown: [`[${path}#${tag}]`, "```text", summary, "```"].join("\n") };
   }
 
-  return { markdown: renderContent(path, fullText, tag, target.ranges, target.explicitSelector ? undefined : 200) };
+  return { markdown: renderContent(path, fullText, tag, target.ranges, target.explicitSelector ? undefined : 200, ctx) };
 }
 
 async function renderDirectory(uri: vscode.Uri): Promise<string> {
@@ -241,27 +259,36 @@ async function renderDirectoryTree(uri: vscode.Uri, depth: number, maxDepth: num
   return lines;
 }
 
-function renderContent(path: string, content: string, tag: string, ranges?: ReadRange[], defaultLimit?: number): string {
+function renderContent(path: string, content: string, tag: string, ranges?: ReadRange[], defaultLimit?: number, ctx?: AlphaContext): string {
   if (!ranges?.length) {
     const lines = content.split(/\r?\n/);
     if (defaultLimit && lines.length > defaultLimit) {
       const selected = lines.slice(0, defaultLimit).map((line, index) => `${index + 1}:${line}`);
       selected.push(`[${lines.length - defaultLimit} lines elided; re-read needed ranges, e.g. ${path}:${defaultLimit + 1}-${Math.min(lines.length, defaultLimit + 80)}]`);
-      return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+      return appendConflictWarning([`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n"), ctx, path, lines.slice(0, defaultLimit), 1);
     }
-    return renderAnchoredFileWithTag(path, content, tag);
+    return appendConflictWarning(renderAnchoredFileWithTag(path, content, tag), ctx, path, lines, 1);
   }
 
   const lines = content.split(/\r?\n/);
   const selected: string[] = [];
+  const visibleBlocks: Array<{ lines: string[]; firstLine: number }> = [];
   for (const range of ranges) {
     const start = range.startLine;
     const end = Math.min(lines.length, range.endLine ?? lines.length);
+    const rangeLines: string[] = [];
     for (let line = start; line <= end; line++) {
-      selected.push(`${line}:${lines[line - 1] ?? ""}`);
+      const value = lines[line - 1] ?? "";
+      selected.push(`${line}:${value}`);
+      rangeLines.push(value);
     }
+    visibleBlocks.push({ lines: rangeLines, firstLine: start });
   }
-  return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+  const rendered = [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+  if (!ctx) return rendered;
+  const entries = visibleBlocks.flatMap((block) => registerConflicts(ctx.conflicts, scanConflictLines(block.lines, block.firstLine, path, path)));
+  const warning = formatConflictWarning(entries);
+  return warning ? `${rendered}\n\n${warning}` : rendered;
 }
 
 function renderAdapterResource(resource: InternalResource | ReadAdapterResult, ranges?: ReadRange[], defaultLimit?: number): string {
@@ -301,29 +328,29 @@ function renderRawContent(content: string, ranges?: ReadRange[]): string {
   return selected.join("\n");
 }
 
-function renderConflicts(path: string, content: string, tag: string): string {
-  const lines = content.split(/\r?\n/);
-  const selected: string[] = [];
-  let inConflict = false;
-  let start = 0;
-
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    if (line.startsWith("<<<<<<<")) {
-      inConflict = true;
-      start = Math.max(0, index - 2);
-    }
-    if (inConflict && line.startsWith(">>>>>>>")) {
-      const end = Math.min(lines.length - 1, index + 2);
-      for (let lineIndex = start; lineIndex <= end; lineIndex++) {
-        selected.push(`${lineIndex + 1}:${lines[lineIndex] ?? ""}`);
-      }
-      inConflict = false;
-    }
+function renderRegisteredConflict(id: number, scope: "ours" | "theirs" | "base" | undefined, ctx: AlphaContext): string {
+  const entry = ctx.conflicts.get(id);
+  if (!entry) {
+    throw new Error(`Conflict #${id} not found. Conflict ids are registered when read surfaces marker blocks; re-read the file or use <path>:conflicts.`);
   }
+  const region = renderConflictRegion(entry, scope);
+  const lines = region.lines.map((line, index) => `${region.startLine + index}:${line}`);
+  const label = scope ? `conflict://${id}/${scope}` : `conflict://${id}`;
+  return [`[${label} ${entry.displayPath}]`, "```text", ...lines, "```"].join("\n");
+}
 
-  if (!selected.length) return `[${path}#${tag}]\nNo conflict markers found.`;
-  return [`[${path}#${tag}]`, "```text", ...selected, "```"].join("\n");
+function renderConflicts(path: string, content: string, tag: string, ctx: AlphaContext): string {
+  const blocks = scanConflictLines(content.split(/\r?\n/), 1, path, path);
+  const entries = registerConflicts(ctx.conflicts, blocks);
+  return [`[${path}#${tag}]`, formatConflictSummary(entries, path)].join("\n");
+}
+
+function appendConflictWarning(rendered: string, ctx: AlphaContext | undefined, path: string, visibleLines: string[], firstLine: number): string {
+  if (!ctx) return rendered;
+  const blocks = scanConflictLines(visibleLines, firstLine, path, path);
+  const entries = registerConflicts(ctx.conflicts, blocks);
+  const warning = formatConflictWarning(entries);
+  return warning ? `${rendered}\n\n${warning}` : rendered;
 }
 
 function parseRanges(input: string): ReadRange[] {

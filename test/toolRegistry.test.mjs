@@ -14,6 +14,7 @@ import {
 } from "../out/toolRegistry.js";
 import { buildAlphaSystemPrompt } from "../out/promptBuilder.js";
 import {
+  askApproval,
   bashApproval,
   bitbucketApproval,
   browserApproval,
@@ -26,6 +27,14 @@ import {
   webSearchApproval,
   writeApproval,
 } from "../out/approvalCore.js";
+import {
+  ASK_OTHER_OPTION,
+  ASK_RECOMMENDED_SUFFIX,
+  formatAskResult,
+  optionLabelForDisplay,
+  parseAskInput,
+  stripRecommendedSuffix,
+} from "../out/askCore.js";
 import {
   notebookToText,
   readArchiveTarget,
@@ -41,8 +50,15 @@ import {
   parseDuckDuckGoHtml,
   parseWebSearchInput,
 } from "../out/webSearchCore.js";
-import { InMemoryArtifactStore, InMemoryFileSnapshotStore, InMemoryTodoStore } from "../out/store.js";
+import { InMemoryArtifactStore, InMemoryConflictStore, InMemoryFileSnapshotStore, InMemoryPendingEditStore, InMemoryPermissionDecisionStore, InMemoryTodoStore } from "../out/store.js";
 import { InMemoryBashJobStore, InMemoryDiscoveredToolStore } from "../out/store.js";
+import {
+  expandConflictTokens,
+  parseConflictUri,
+  renderConflictRegion,
+  scanConflictLines,
+  spliceConflict,
+} from "../out/conflictCore.js";
 import { jobTool } from "../out/tools/job.js";
 import {
   parseEvalInput,
@@ -98,6 +114,22 @@ import {
   wrapInternalForModel,
 } from "../out/transcript.js";
 import {
+  buildReviewPrompt,
+  getRecommendedAgentCount,
+  parseDiff,
+  parseReportFindingDetails,
+  toReviewFinding,
+} from "../out/reviewCore.js";
+import {
+  buildPatchForChange,
+  computeDependencyOrder,
+  formatCommitMessage,
+  parseCommitCommandArgs,
+  parseDiffChunks,
+  validateCommitProposal,
+  validateSplitCommitPlan,
+} from "../out/commitCore.js";
+import {
   formatCodeActions,
   formatDiagnostics,
   formatIacLspStatus,
@@ -110,15 +142,31 @@ import {
   unsupportedLspAction,
 } from "../out/lspCore.js";
 import {
+  duplicateTopLevelPythonDefinitions,
+} from "../out/pythonStaticChecks.js";
+import {
+  assertPlanModeWriteAllowed,
+  createPlanModeState,
+  renderPlanReview,
+} from "../out/planMode.js";
+import {
+  applyJsonPath,
+  parseJsonPath,
+} from "../out/jsonPath.js";
+import {
   BITBUCKET_OPS,
   bitbucketApiUrl,
+  bitbucketCodeSearchUrls,
   applyBitbucketDateFilter,
   buildCheckoutMetadata,
   bitbucketPrPayload,
   parseSearchDateBound,
+  formatBitbucketCodeSearchResults,
   formatBitbucketPr,
+  normalizeBitbucketCodeSearchResults,
   parseBitbucketInput,
   parseBitbucketRemoteUrl,
+  requireBitbucketCodeSearchQuery,
   resolveBitbucketAuth,
   resolveBitbucketRepo,
   unsupportedBitbucketOp,
@@ -126,7 +174,7 @@ import {
 test("public tools are advertised by default", () => {
   const names = getAdvertisedAlphaLanguageModelTools().map((tool) => tool.name);
 
-  assert.deepEqual(names, ["read", "bash", "search", "find", "web_search", "edit", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
+  assert.deepEqual(names, ["read", "bash", "search", "find", "web_search", "ask", "edit", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
 });
 
 test("normalized transcript finds the first real user message", () => {
@@ -185,10 +233,14 @@ test("history markdown labels compaction as non-user context", () => {
 test("hidden tools are registered but not advertised by default", () => {
   assert.equal(getAlphaToolRegistration("resolve")?.visibility, "hidden");
   assert.equal(getAlphaToolRegistration("search_tool_bm25")?.visibility, "hidden");
+  assert.equal(getAlphaToolRegistration("report_finding")?.visibility, "hidden");
+  assert.equal(getAlphaToolRegistration("yield")?.visibility, "hidden");
 
   const advertisedNames = new Set(getAdvertisedAlphaTools().map((tool) => tool.name));
   assert.equal(advertisedNames.has("resolve"), false);
   assert.equal(advertisedNames.has("search_tool_bm25"), false);
+  assert.equal(advertisedNames.has("report_finding"), false);
+  assert.equal(advertisedNames.has("yield"), false);
 });
 
 test("hidden tools can be forced for a workflow", () => {
@@ -213,6 +265,17 @@ test("search_tool_bm25 exposes OMP-style discovery schema", () => {
   assert.equal(tool.inputSchema.properties.limit.type, "number");
 });
 
+test("review workflow exposes hidden report_finding and yield schemas", () => {
+  const report = getAlphaToolRegistration("report_finding");
+  const yieldTool = getAlphaToolRegistration("yield");
+
+  assert.equal(report.visibility, "hidden");
+  assert.deepEqual(report.inputSchema.required, ["title", "body", "priority", "confidence", "file_path", "line_start", "line_end"]);
+  assert.deepEqual(report.inputSchema.properties.priority.enum, ["P0", "P1", "P2", "P3"]);
+  assert.equal(yieldTool.visibility, "hidden");
+  assert.equal(yieldTool.inputSchema.properties.data.type, "object");
+});
+
 test("essential-only selection follows OMP-style load modes", () => {
   assert.deepEqual(DEFAULT_ESSENTIAL_TOOL_NAMES, ["read", "bash", "edit"]);
   assert.deepEqual(getEssentialAlphaToolNames(), ["read", "bash", "edit"]);
@@ -222,7 +285,7 @@ test("essential-only selection follows OMP-style load modes", () => {
 });
 
 test("discoverable public tools are classified separately from essentials", () => {
-  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "web_search", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
+  assert.deepEqual(getDiscoverableAlphaToolNames(), ["search", "find", "web_search", "ask", "write", "lsp", "bitbucket", "job", "task", "eval", "todo"]);
 });
 
 test("registry names are unique", () => {
@@ -289,6 +352,18 @@ test("web_search exposes OMP-style query contract", () => {
   assert.deepEqual(tool.inputSchema.properties.recency.enum, ["day", "week", "month", "year"]);
   assert.equal(tool.inputSchema.properties.limit.type, "number");
   assert.equal(tool.inputSchema.properties.num_search_results.type, "number");
+});
+
+test("ask exposes OMP-style question picker contract", () => {
+  const tool = getAlphaToolRegistration("ask");
+
+  assert.equal(tool.visibility, "public");
+  assert.equal(tool.loadMode, "discoverable");
+  assert.deepEqual(tool.inputSchema.required, ["questions"]);
+  const question = tool.inputSchema.properties.questions.items;
+  assert.deepEqual(question.required, ["id", "question", "options"]);
+  assert.equal(question.properties.multi.type, "boolean");
+  assert.equal(question.properties.recommended.type, "number");
 });
 
 test("lsp exposes OMP-style action contract", () => {
@@ -566,6 +641,23 @@ test("lsp core formats and selects code actions by index title and kind", () => 
   assert.equal(selectCodeActionIndex(actions, "extract"), undefined);
 });
 
+test("post-mutation diagnostics catch duplicate top-level Python defs without LSP", () => {
+  const checks = duplicateTopLevelPythonDefinitions("hello.py", [
+    "def greet():",
+    "    return 'hi'",
+    "",
+    "class Example:",
+    "    def greet(self):",
+    "        return 'method names are independent'",
+    "",
+    "def greet():",
+    "    return 'again'",
+  ].join("\n"));
+
+  assert.equal(checks.length, 1);
+  assert.match(checks[0], /hello\.py:8:1 Warning \[alpha-python\]: duplicate top-level function `greet`; first defined on line 1/);
+});
+
 test("bitbucket core parses input, auth, remotes, and API URLs", () => {
   assert.deepEqual(parseBitbucketInput(JSON.stringify({
     op: "pr_create",
@@ -675,6 +767,53 @@ test("bitbucket core formats PRs and creates Cloud/Server payloads", () => {
     { title: "old", updated_on: "2026-06-10T00:00:00Z" },
     { title: "new", updated_on: "2026-06-12T00:00:00Z" },
   ], { since: "2026-06-11", until: undefined, dateField: "updated" }).map((item) => item.title), ["new"]);
+});
+
+test("bitbucket search_code follows OMP-style code search behavior", () => {
+  const repo = resolveBitbucketRepo({ repo: "PROJ/service" }, undefined, "https://bitbucket.example.com");
+  const input = parseBitbucketInput(JSON.stringify({ op: "search_code", query: "findThing", limit: 2 }));
+
+  assert.equal(requireBitbucketCodeSearchQuery(input), "findThing");
+  assert.throws(
+    () => requireBitbucketCodeSearchQuery(parseBitbucketInput(JSON.stringify({ op: "search_code", query: "findThing", since: "3d" }))),
+    /search_code does not support since\/until/,
+  );
+
+  assert.deepEqual(bitbucketCodeSearchUrls(repo, input, ["/custom/search?q={query}&repo={repo}&n={limit}"]), [
+    "https://bitbucket.example.com/custom/search?q=findThing&repo=PROJ%2Fservice&n=2",
+    "https://bitbucket.example.com/rest/search/latest/search?query=findThing&limit=2&project=PROJ&repository=service",
+    "https://bitbucket.example.com/rest/search/latest/search?query=findThing&limit=2&projectKey=PROJ&repositorySlug=service",
+    "https://bitbucket.example.com/rest/search/latest/search?query=findThing&limit=2&repo=PROJ%2Fservice",
+  ]);
+
+  const rawCodeSearchData = {
+    values: [
+      {
+        path: { components: ["src", "lib.ts"] },
+        repository: { project: { key: "PROJ" }, slug: "service" },
+        commit: { hash: "abcdef1234567890" },
+        links: { self: [{ href: "https://bitbucket.example.com/projects/PROJ/repos/service/browse/src/lib.ts" }] },
+        hitContexts: [{ text: "function findThing(): void {\n  return;" }],
+      },
+    ],
+  };
+  const normalized = normalizeBitbucketCodeSearchResults(rawCodeSearchData);
+  assert.deepEqual(normalized, [{
+    path: "src/lib.ts",
+    repo: "PROJ/service",
+    commit: "abcdef1234567890",
+    url: "https://bitbucket.example.com/projects/PROJ/repos/service/browse/src/lib.ts",
+    match: "function findThing(): void {\n  return;",
+  }]);
+
+  const formatted = formatBitbucketCodeSearchResults(repo, "findThing", rawCodeSearchData, 2);
+  assert.match(formatted, /# Bitbucket code search/);
+  assert.match(formatted, /Query: findThing/);
+  assert.match(formatted, /Repository: PROJ\/service/);
+  assert.match(formatted, /- src\/lib\.ts/);
+  assert.match(formatted, /  Repo: PROJ\/service/);
+  assert.match(formatted, /  Commit: abcdef123456/);
+  assert.match(formatted, /  Match: function findThing\(\): void \{ return;/);
 });
 
 test("read structural summaries cover OMP IaC file families", () => {
@@ -957,6 +1096,191 @@ test("task parses OMP-style agent frontmatter", () => {
   assert.match(agent.systemPrompt, /Review carefully/);
 });
 
+test("bundled reviewer agent mirrors OMP review contract", async () => {
+  const discovered = await discoverAgents(process.cwd(), path.join(tmpdir(), "alpha-no-home"));
+  const reviewer = discovered.agents.find((agent) => agent.name === "reviewer");
+
+  assert.ok(reviewer);
+  assert.equal(reviewer.blocking, true);
+  assert.deepEqual(reviewer.tools, ["read", "search", "find", "bash", "lsp", "web_search", "report_finding", "yield"]);
+  assert.match(reviewer.systemPrompt, /Call `report_finding` per issue/);
+  assert.match(reviewer.systemPrompt, /Final `yield` data must include/);
+  assert.deepEqual(reviewer.output.properties.overall_correctness.enum, ["correct", "incorrect"]);
+});
+
+test("review core parses diffs, filters noise, and builds OMP review prompt", () => {
+  const diff = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1 +1 @@",
+    "-export const value = 1;",
+    "+export const value = 2;",
+    "diff --git a/package-lock.json b/package-lock.json",
+    "--- a/package-lock.json",
+    "+++ b/package-lock.json",
+    "@@ -1 +1 @@",
+    "-{}",
+    "+{\"x\":1}",
+  ].join("\n");
+
+  const stats = parseDiff(diff);
+  const prompt = buildReviewPrompt("Reviewing uncommitted changes (staged + unstaged)", stats, diff);
+
+  assert.equal(stats.files.length, 1);
+  assert.equal(stats.files[0].path, "src/app.ts");
+  assert.equal(stats.excluded[0].path, "package-lock.json");
+  assert.equal(stats.excluded[0].reason, "lock file");
+  assert.equal(getRecommendedAgentCount(stats), 1);
+  assert.match(prompt, /Use the `task` tool with `agent: "reviewer"`/);
+  assert.match(prompt, /Call `report_finding` per issue/);
+  assert.match(prompt, /<diff>/);
+});
+
+test("report_finding details convert to reviewer output priority ordinals", () => {
+  const details = parseReportFindingDetails({
+    title: "Handle null response",
+    body: "A null API response reaches property access and throws.",
+    priority: "P1",
+    confidence: 0.9,
+    file_path: "src/app.ts",
+    line_start: 12,
+    line_end: 13,
+  });
+
+  assert.ok(details);
+  assert.equal(toReviewFinding(details).priority, 1);
+});
+
+test("commit core parses OMP-style commit flags", () => {
+  assert.deepEqual(parseCommitCommandArgs("--dry-run --push --ticket smad-150 --context \"release fix\""), {
+    dryRun: true,
+    push: true,
+    ticket: "SMAD-150",
+    context: "release fix",
+  });
+  assert.deepEqual(parseCommitCommandArgs("auth boundary cleanup"), {
+    dryRun: false,
+    push: false,
+    context: "auth boundary cleanup",
+  });
+  assert.equal(parseCommitCommandArgs("--ticket=SMAD-151").ticket, "SMAD-151");
+  assert.throws(() => parseCommitCommandArgs("--ticket nope"), /Invalid ticket/);
+});
+
+test("commit core validates conventional single commit messages", () => {
+  const invalid = validateCommitProposal({
+    type: "fix",
+    scope: "Auth",
+    summary: "fix login bug.",
+    details: [],
+    issue_refs: [],
+  }, ["src/auth.ts"]);
+
+  assert.equal(invalid.valid, false);
+  assert.match(invalid.errors.join("\n"), /past-tense/);
+  assert.match(invalid.errors.join("\n"), /period/);
+  assert.match(invalid.errors.join("\n"), /lowercase/);
+
+  const valid = validateCommitProposal({
+    type: "fix",
+    scope: "auth",
+    summary: "Fixed expired token handling",
+    details: [{ text: "Rejected expired tokens before session lookup." }],
+    issue_refs: [],
+  }, ["src/auth.ts"]);
+
+  assert.equal(valid.valid, true);
+  assert.equal(formatCommitMessage(valid.proposal), "fix(auth): Fixed expired token handling\n\n- Rejected expired tokens before session lookup.");
+  assert.equal(formatCommitMessage(valid.proposal, { ticket: "SMAD-150" }), "SMAD-150: Fixed expired token handling\n\n- Rejected expired tokens before session lookup.");
+});
+
+test("commit core strips accidental ticket prefixes from model summaries", () => {
+  const valid = validateCommitProposal({
+    type: "fix",
+    scope: "auth",
+    summary: "SMAD-150: Fixed expired token handling",
+    details: [],
+    issue_refs: [],
+  }, ["src/auth.ts"]);
+
+  assert.equal(valid.valid, true);
+  assert.equal(valid.proposal.summary, "Fixed expired token handling");
+  assert.equal(formatCommitMessage(valid.proposal, { ticket: "SMAD-150" }), "SMAD-150: Fixed expired token handling");
+});
+
+test("commit core rejects split dependency cycles before execution", () => {
+  const result = computeDependencyOrder([{ dependencies: [1] }, { dependencies: [0] }]);
+
+  assert.deepEqual(result, { error: "Circular dependency detected in split commit plan." });
+});
+
+test("commit core validates split coverage and hunk selectors", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,3 +1,3 @@",
+    " export function a() {",
+    "-  return 1;",
+    "+  return 2;",
+    " }",
+    "diff --git a/src/b.ts b/src/b.ts",
+    "index 3333333..4444444 100644",
+    "--- a/src/b.ts",
+    "+++ b/src/b.ts",
+    "@@ -1,3 +1,3 @@",
+    " export function b() {",
+    "-  return 1;",
+    "+  return 2;",
+    " }",
+  ].join("\n");
+
+  const missing = validateSplitCommitPlan({
+    commits: [
+      { changes: [{ path: "src/a.ts", hunks: { type: "indices", indices: [2] } }], type: "fix", scope: null, summary: "Fixed invalid selector handling" },
+      { changes: [{ path: "src/a.ts", hunks: { type: "all" } }], type: "fix", scope: null, summary: "Fixed duplicate split coverage" },
+    ],
+  }, ["src/a.ts", "src/b.ts"], diff);
+
+  assert.equal(missing.valid, false);
+  assert.match(missing.errors.join("\n"), /No hunks selected for src\/a\.ts/);
+  assert.match(missing.errors.join("\n"), /File appears in multiple commits/);
+  assert.match(missing.errors.join("\n"), /Staged file missing from split plan: src\/b\.ts/);
+
+  const valid = validateSplitCommitPlan({
+    commits: [
+      { changes: [{ path: "src/a.ts", hunks: { type: "all" } }], type: "fix", scope: null, summary: "Fixed alpha calculation" },
+      { changes: [{ path: "src/b.ts", hunks: { type: "all" } }], type: "fix", scope: null, summary: "Fixed beta calculation", dependencies: [0] },
+    ],
+  }, ["src/a.ts", "src/b.ts"], diff);
+
+  assert.equal(valid.valid, true);
+  assert.deepEqual(computeDependencyOrder(valid.proposal.commits), [0, 1]);
+});
+
+test("commit core extracts patches for hunk staging", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,3 +1,3 @@",
+    " export function a() {",
+    "-  return 1;",
+    "+  return 2;",
+    " }",
+  ].join("\n");
+  const chunks = parseDiffChunks(diff);
+
+  const patch = buildPatchForChange(chunks, { path: "src/a.ts", hunks: { type: "indices", indices: [1] } });
+
+  assert.match(patch, /diff --git a\/src\/a\.ts b\/src\/a\.ts/);
+  assert.match(patch, /@@ -1,3 \+1,3 @@/);
+  assert.match(patch, /\+  return 2;/);
+});
+
 test("task description lists agents and Alpha host limitations", () => {
   const rendered = renderTaskDescription([
     { name: "explore", description: "Read-only scan", tools: ["read", "search"], systemPrompt: "", source: "bundled" },
@@ -1027,8 +1351,56 @@ test("resolve uses the hidden OMP-style action contract", () => {
   const resolve = getAlphaToolRegistration("resolve");
 
   assert.deepEqual(resolve.inputSchema.required, ["action", "reason"]);
-  assert.deepEqual(resolve.inputSchema.properties.action.enum, ["apply", "discard"]);
+  assert.deepEqual(resolve.inputSchema.properties.action.enum, ["apply", "refine", "discard"]);
 });
+
+test("plan mode exposes OMP-style read-only tool surface with resolve", () => {
+  const ctx = makeToolContext({ planMode: createPlanModeState("inspect before editing") });
+  const names = getAdvertisedAlphaLanguageModelTools({ ctx, includeDiscoverable: true, forceTools: ["resolve"] }).map((tool) => tool.name);
+
+  assert.deepEqual(names, ["read", "search", "find", "web_search", "ask", "write", "lsp", "resolve", "todo"]);
+});
+
+test("plan mode blocks workspace writes and allows local plan artifacts", () => {
+  const ctx = makeToolContext({ planMode: createPlanModeState("draft a plan") });
+
+  assert.doesNotThrow(() => assertPlanModeWriteAllowed("local://auth-refactor-plan.md", ctx));
+  assert.throws(
+    () => assertPlanModeWriteAllowed("src/app.ts", ctx),
+    /Plan mode keeps the workspace read-only/,
+  );
+});
+
+test("plan review can display an approved inactive plan for retry", () => {
+  const state = createPlanModeState("draft a plan");
+  state.active = false;
+  state.pendingApproval = false;
+  state.approvedPlan = "Goal: update hello.py safely.";
+  state.approvedPlanPath = "local://alpha-plan.md";
+
+  const rendered = renderPlanReview(state);
+
+  assert.match(rendered, /Status: approved for implementation/);
+  assert.match(rendered, /approve and implement/);
+  assert.match(rendered, /refine: <change>/);
+  assert.match(rendered, /Goal: update hello\.py safely/);
+});
+
+test("plan review distinguishes pending approval from retryable approved plan", () => {
+  const pending = createPlanModeState("draft a plan");
+  pending.pendingApproval = true;
+  pending.approvedPlan = "Goal: pending.";
+
+  const retryable = createPlanModeState("draft a plan");
+  retryable.active = false;
+  retryable.pendingApproval = false;
+  retryable.approvedPlan = "Goal: retryable.";
+
+  assert.match(renderPlanReview(pending), /Status: waiting for user approval/);
+  assert.match(renderPlanReview(retryable), /Status: approved for implementation/);
+  assert.doesNotMatch(renderPlanReview(retryable), /waiting for user approval/);
+});
+
 
 test("tool descriptions steer existing-file changes to edit over write", () => {
   const edit = getAlphaToolRegistration("edit");
@@ -1045,7 +1417,13 @@ test("system prompt includes OMP-style tool priority", () => {
   assert.match(prompt, /terminal work.*`bash`/);
   assert.match(prompt, /artifact:\/\/\.\.\./);
   assert.match(prompt, /surgical existing-file edits -> `edit`, not `write`/);
+  assert.match(prompt, /mutation results include a concise diagnostics summary/);
+  assert.match(prompt, /Merge conflicts: read `<path>:conflicts`/);
+  assert.match(prompt, /conflict:\/\/<N>/);
   assert.match(prompt, /file\/dir reads -> `read`/);
+  assert.match(prompt, /user clarification\/input -> `ask`/);
+  assert.match(prompt, /# Ask/);
+  assert.match(prompt, /Default to action/);
   assert.match(prompt, /per-chat shell session state/);
   assert.match(prompt, /Use `job` to list or inspect background bash jobs/);
   assert.match(prompt, /cancel: \[id\]/);
@@ -1055,7 +1433,7 @@ test("system prompt includes OMP-style tool priority", () => {
   assert.match(prompt, /Use `find` for every file-name lookup/);
   assert.match(prompt, /grouped by directory/);
   assert.match(prompt, /Use `lsp` for symbol-aware operations/);
-  assert.match(prompt, /Bitbucket repository and pull-request workflows -> `bitbucket`/);
+  assert.match(prompt, /Bitbucket repository, pull-request, and remote code-search workflows -> `bitbucket`/);
   assert.match(prompt, /# Bitbucket/);
   assert.match(prompt, /BITBUCKET_TOKEN/);
   assert.match(prompt, /pr:\/\/<N>\/diff/);
@@ -1098,6 +1476,64 @@ test("artifact store uses OMP-style numeric file-backed artifacts", async () => 
   } finally {
     rmSync(artifactDir, { recursive: true, force: true });
   }
+});
+
+test("agent URL JSON path helpers support dot and slash extraction", () => {
+  const data = { findings: [{ path: "src/app.ts", confidence: 0.9, "special-key": ["ok"] }] };
+
+  assert.deepEqual(parseJsonPath("findings.0.path"), ["findings", 0, "path"]);
+  assert.deepEqual(parseJsonPath(".findings[0]['special-key'][0]"), ["findings", 0, "special-key", 0]);
+  assert.equal(applyJsonPath(data, "findings.0.path"), "src/app.ts");
+  assert.equal(applyJsonPath(data, ".findings[0].path"), "src/app.ts");
+  assert.equal(applyJsonPath(data, ".findings[0]['special-key'][0]"), "ok");
+  assert.equal(applyJsonPath(data, "findings/0/confidence"), 0.9);
+  assert.equal(applyJsonPath(data, "findings.1.path"), undefined);
+});
+
+test("conflict core registers and resolves OMP-style conflict URLs", () => {
+  const text = [
+    "prefix",
+    "<<<<<<< HEAD",
+    "ours",
+    "=======",
+    "theirs",
+    ">>>>>>> feature",
+    "suffix",
+  ].join("\n");
+  const store = new InMemoryConflictStore();
+  const [block] = scanConflictLines(text.split("\n"), 1, "app.py", "app.py");
+  const entry = store.register(block);
+
+  assert.deepEqual(parseConflictUri("conflict://1"), { id: 1 });
+  assert.deepEqual(parseConflictUri("app.py:conflict://1/theirs"), {
+    id: 1,
+    scope: "theirs",
+    recoveredPrefix: "app.py",
+  });
+  assert.equal(store.register(block).id, entry.id);
+  assert.deepEqual(renderConflictRegion(entry, "theirs"), { lines: ["theirs"], startLine: 5 });
+  assert.equal(expandConflictTokens("@theirs", entry), "theirs");
+  assert.equal(spliceConflict(text, entry, expandConflictTokens("@theirs", entry)), "prefix\ntheirs\nsuffix");
+});
+
+test("conflict core supports diff3 base sections and rejects invalid conflict URLs", () => {
+  const text = [
+    "<<<<<<< ours",
+    "ours body",
+    "||||||| base",
+    "base body",
+    "=======",
+    "theirs body",
+    ">>>>>>> theirs",
+  ].join("\n");
+  const store = new InMemoryConflictStore();
+  const [block] = scanConflictLines(text.split("\n"), 20, "merge.txt", "merge.txt");
+  const entry = store.register(block);
+
+  assert.deepEqual(renderConflictRegion(entry, "base"), { lines: ["base body"], startLine: 23 });
+  assert.equal(spliceConflict(text, entry, expandConflictTokens("@base", entry)), "base body");
+  assert.throws(() => parseConflictUri("conflict://*/ours"), /wildcard/);
+  assert.throws(() => parseConflictUri("conflict://0"), /id must be >= 1/);
 });
 
 test("approval modes follow OMP tier comparisons", () => {
@@ -1152,6 +1588,7 @@ test("approval tool tier mapping matches current and planned OMP tools", () => {
   assert.equal(sshApproval({}), "exec");
   assert.equal(browserApproval({}), "exec");
   assert.equal(webSearchApproval({}), "read");
+  assert.equal(askApproval({}), "read");
   assert.equal(bitbucketApproval({ op: "pr_view" }), "read");
   assert.equal(bitbucketApproval({ op: "pr_create" }), "exec");
   assert.equal(lspApproval({ action: "references" }), "read");
@@ -1243,6 +1680,52 @@ test("web_search core parses DuckDuckGo HTML into OMP-style sources", () => {
     snippet: "Official docs snippet",
   }]);
   assert.match(formatWebSearchForLlm({ provider: "duckduckgo_html", sources, searchQueries: ["alpha harness"] }), /\[1\] Example & Docs/);
+});
+
+test("ask core parses OMP-style questions and formats answers", () => {
+  const parsed = parseAskInput(JSON.stringify({
+    questions: [{
+      id: "auth_method",
+      question: "Which authentication method?",
+      options: [
+        { label: "JWT", description: "Stateless API clients." },
+        { label: "Session cookies" },
+      ],
+      recommended: 0,
+    }],
+  }));
+
+  assert.equal(parsed.questions[0].id, "auth_method");
+  assert.equal(optionLabelForDisplay(parsed.questions[0].options[0], 0, 0), `JWT${ASK_RECOMMENDED_SUFFIX}`);
+  assert.equal(stripRecommendedSuffix(`JWT${ASK_RECOMMENDED_SUFFIX}`), "JWT");
+  assert.equal(ASK_OTHER_OPTION, "Other (type your own)");
+  assert.equal(formatAskResult([{
+    id: "auth_method",
+    question: "Which authentication method?",
+    options: ["JWT", "Session cookies"],
+    multi: false,
+    selectedOptions: ["JWT"],
+  }]), "User selected: JWT");
+});
+
+test("ask core formats multi-question answers", () => {
+  assert.equal(formatAskResult([
+    {
+      id: "storage",
+      question: "Storage?",
+      options: ["SQLite", "PostgreSQL"],
+      multi: false,
+      selectedOptions: ["SQLite"],
+    },
+    {
+      id: "extras",
+      question: "Extras?",
+      options: ["Metrics", "Tracing"],
+      multi: true,
+      selectedOptions: ["Metrics"],
+      customInput: "Also add logs",
+    },
+  ]), "User answers:\n- storage: SQLite\n- extras: Metrics; custom: Also add logs");
 });
 
 test("read adapter converts fetched HTML URLs into markdown-like reader text", async () => {
@@ -1383,8 +1866,13 @@ function makeTar(files) {
 
 function makeToolContext(overrides = {}) {
   return {
+    artifacts: new InMemoryArtifactStore(),
     bashJobs: new InMemoryBashJobStore(),
+    conflicts: new InMemoryConflictStore(),
     discoveredTools: new InMemoryDiscoveredToolStore(),
+    pendingEdits: new InMemoryPendingEditStore(),
+    permissionDecisions: new InMemoryPermissionDecisionStore(),
+    snapshots: new InMemoryFileSnapshotStore(),
     todos: new InMemoryTodoStore(),
     token: { isCancellationRequested: false },
     ...overrides,

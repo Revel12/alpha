@@ -1,5 +1,6 @@
 import type * as vscode from "vscode";
 import { BITBUCKET_OPS } from "./bitbucketCore";
+import { isPlanModeActive } from "./planMode";
 import { schemaKeys } from "./toolDiscoveryCore";
 import type { DiscoverableTool } from "./toolDiscoveryCore";
 import type { AlphaContext, ToolDefinition, ToolResult } from "./types";
@@ -28,6 +29,7 @@ export interface AlphaToolSelection {
 }
 
 export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "bash", "edit"] as const;
+const PLAN_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "todo", "resolve"]);
 
 const stringProperty = (description: string): object => ({ type: "string", description });
 const alwaysEnabled = (): boolean => true;
@@ -156,6 +158,49 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     toArgs: (input) => JSON.stringify(input),
   },
   {
+    name: "ask",
+    visibility: "public",
+    loadMode: "discoverable",
+    description: "Ask the user structured clarifying questions through the VS Code UI. Use only when multiple approaches have materially different tradeoffs the user must decide; the UI automatically supports Other/custom input.",
+    inputSchema: objectSchema(
+      {
+        questions: {
+          type: "array",
+          minItems: 1,
+          description: "Questions to ask the user.",
+          items: {
+            type: "object",
+            properties: {
+              id: stringProperty("Stable question id."),
+              question: stringProperty("Question text."),
+              options: {
+                type: "array",
+                description: "Concise distinct options. Do not add an Other option; Alpha adds it automatically.",
+                items: {
+                  type: "object",
+                  properties: {
+                    label: stringProperty("Short display label."),
+                    description: stringProperty("Optional explanatory tradeoff text."),
+                  },
+                  required: ["label"],
+                  additionalProperties: false,
+                },
+              },
+              multi: { type: "boolean", description: "Allow multiple selections." },
+              recommended: { type: "number", description: "0-based recommended option index." },
+            },
+            required: ["id", "question", "options"],
+            additionalProperties: false,
+          },
+        },
+      },
+      ["questions"],
+    ),
+    enabled: alwaysEnabled,
+    loadTool: async () => (await import("./tools/ask.js")).askTool,
+    toArgs: (input) => JSON.stringify(input),
+  },
+  {
     name: "edit",
     visibility: "public",
     loadMode: "essential",
@@ -229,7 +274,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     name: "bitbucket",
     visibility: "public",
     loadMode: "discoverable",
-    description: "Interact with Bitbucket repositories and pull requests. OMP-style repo-host workflow tool replacing GitHub-specific operations; use read/search/find for checked-out code browsing and code search.",
+    description: "Interact with Bitbucket repositories and pull requests. OMP-style repo-host workflow tool replacing GitHub-specific operations; use search_code for remote code discovery and read/search/find for checked-out editable code.",
     inputSchema: objectSchema(
       {
         op: { type: "string", enum: BITBUCKET_OPS, description: "Bitbucket operation to run." },
@@ -249,7 +294,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
         sourceBranch: stringProperty("Source branch for pr_create."),
         targetBranch: stringProperty("Target branch for pr_create. Defaults to main."),
         branch: stringProperty("Local branch for pr_checkout/pr_push, or source branch fallback for pr_create."),
-        query: stringProperty("Search query. For Server PR search this is applied client-side to the returned page."),
+        query: stringProperty("Search query. Required for search_code. For Server PR search this is applied client-side to the returned page."),
         since: stringProperty("Lower-bound date filter. Supports relative durations like 3d and ISO dates where Alpha can filter returned data."),
         until: stringProperty("Upper-bound date filter. Supports relative durations like 3d and ISO dates where Alpha can filter returned data."),
         dateField: { type: "string", enum: ["created", "updated"], description: "Date field for since/until filters. Defaults to created." },
@@ -358,14 +403,52 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     description: "Apply or discard the pending Alpha preview action.",
     inputSchema: objectSchema(
       {
-        action: { type: "string", enum: ["apply", "discard"], description: "Resolution action for pending preview work." },
+        action: { type: "string", enum: ["apply", "refine", "discard"], description: "Resolution action for pending preview work or plan mode." },
         reason: stringProperty("Brief reason for applying or discarding the pending work."),
         extra: { type: "object", description: "Optional workflow-specific resolution data." },
       },
       ["action", "reason"],
     ),
-    enabled: (ctx) => !ctx || ctx.pendingEdits.list().length > 0,
+    enabled: (ctx) => !ctx || ctx.pendingEdits.list().length > 0 || isPlanModeActive(ctx),
     loadTool: async () => (await import("./tools/resolve.js")).resolveTool,
+    toArgs: (input) => JSON.stringify(input),
+  },
+  {
+    name: "report_finding",
+    visibility: "hidden",
+    loadMode: "discoverable",
+    description: "Hidden review-subagent tool for recording a structured code review finding with P0-P3 priority, confidence, file path, and line range.",
+    inputSchema: objectSchema(
+      {
+        title: stringProperty("Imperative finding title, 80 characters or fewer."),
+        body: stringProperty("One paragraph explaining bug, trigger condition, and impact."),
+        priority: { type: "string", enum: ["P0", "P1", "P2", "P3"], description: "Finding priority." },
+        confidence: { type: "number", minimum: 0, maximum: 1, description: "Confidence the finding is a real bug." },
+        file_path: stringProperty("Path to affected file."),
+        line_start: { type: "number", description: "1-indexed first affected line." },
+        line_end: { type: "number", description: "1-indexed last affected line, at most 10 lines from start." },
+      },
+      ["title", "body", "priority", "confidence", "file_path", "line_start", "line_end"],
+    ),
+    enabled: alwaysEnabled,
+    loadTool: async () => (await import("./tools/reportFinding.js")).reportFindingTool,
+    toArgs: (input) => JSON.stringify(input),
+  },
+  {
+    name: "yield",
+    visibility: "hidden",
+    loadMode: "discoverable",
+    description: "Hidden subagent completion tool. Reviewer agents use it to return verdict data after calling report_finding for each issue.",
+    inputSchema: objectSchema(
+      {
+        status: { type: "string", enum: ["success", "aborted"], description: "Completion status. Defaults to success." },
+        data: { type: "object", description: "Structured final result for the parent." },
+        error: stringProperty("Abort reason when status is aborted."),
+      },
+      [],
+    ),
+    enabled: alwaysEnabled,
+    loadTool: async () => (await import("./tools/yield.js")).yieldTool,
     toArgs: (input) => JSON.stringify(input),
   },
   {
@@ -433,6 +516,7 @@ export function getAdvertisedAlphaTools(selection: AlphaToolSelection = {}): Alp
 
   return alphaToolRegistry.filter((tool) => {
     if (!tool.enabled(selection.ctx)) return false;
+    if (isPlanModeActive(selection.ctx) && !PLAN_MODE_TOOL_NAMES.has(tool.name)) return false;
     if (selection.onlyForced) return forced.has(tool.name);
     if (forced.has(tool.name)) return true;
     if (tool.visibility !== "public") return false;

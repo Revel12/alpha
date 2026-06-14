@@ -3,11 +3,19 @@ import * as pathModule from "node:path";
 import * as vscode from "vscode";
 import { ensureToolPermission } from "../approval";
 import { writeApproval, writeApprovalDetails } from "../approvalCore";
+import {
+  expandConflictTokens,
+  parseConflictUri,
+  spliceConflict,
+  type ConflictEntry,
+} from "../conflictCore";
 import { assertWritableGeneratedContent, assertWritableGeneratedFile } from "../generatedGuard";
 import { renderAnchoredFileWithTag } from "../hash";
 import { isInternalUrlPath, writeInternalUrl } from "../internalUrls";
+import { assertPlanModeWriteAllowed } from "../planMode";
+import { postMutationDiagnostics } from "../postMutationDiagnostics";
 import type { ToolDefinition } from "../types";
-import { relativePath, resolveWorkspaceFile, stat, writeText } from "../workspace";
+import { readOpenDocumentText, relativePath, resolveWorkspaceFile, stat, writeText } from "../workspace";
 import { parseArchiveWriteTarget, parseSqliteWriteTarget, writeArchiveEntry, writeSqliteRow } from "../writeAdapters";
 
 interface WriteInput {
@@ -22,11 +30,28 @@ export const writeTool: ToolDefinition = {
   summary: "Write a workspace file, internal URL, archive member, or SQLite row.",
   async run(args, ctx) {
     const input = parseWriteInput(args);
+    assertPlanModeWriteAllowed(input.path, ctx);
     await ensureToolPermission(
       { name: "write", approval: writeApproval, formatApprovalDetails: writeApprovalDetails },
       input,
       ctx,
     );
+
+    const conflictUri = parseConflictUri(input.path);
+    if (conflictUri) {
+      if (conflictUri.scope) {
+        throw new Error(`Conflict URI scope '/${conflictUri.scope}' is read-only. To write, use conflict://${conflictUri.id} and put @${conflictUri.scope} or replacement content in content.`);
+      }
+      const { content, stripped } = stripHashlineDisplay(input.content);
+      const result = conflictUri.id === "*"
+        ? await resolveAllConflicts(content, ctx)
+        : await resolveSingleConflict(conflictUri.id, content, ctx);
+      const notes = [
+        conflictUri.recoveredPrefix ? `Note: stripped erroneous '${conflictUri.recoveredPrefix}:' prefix from path; conflict URIs are global.` : undefined,
+        stripped ? "Note: auto-stripped hashline display prefixes from content before writing." : undefined,
+      ].filter((note): note is string => Boolean(note));
+      return { markdown: [result, ...notes].join("\n\n") };
+    }
 
     if (isInternalUrlPath(input.path)) {
       const { content, stripped } = stripHashlineDisplay(input.content);
@@ -75,7 +100,7 @@ export const writeTool: ToolDefinition = {
     const { content, stripped } = stripHashlineDisplay(input.content);
     assertWritableGeneratedContent(content, path, input.overwriteGenerated);
     await writeText(uri, content);
-    const postWrite = await runPostWriteHooks(uri, path);
+    const postWrite = await runPostWriteHooks(uri);
     const finalContent = postWrite.content ?? content;
     const snapshot = ctx.snapshots.record(path, finalContent);
     const notes = [
@@ -87,6 +112,57 @@ export const writeTool: ToolDefinition = {
     return { markdown: [`Wrote ${path}.`, ...notes, renderAnchoredFileWithTag(path, finalContent, snapshot.tag)].join("\n\n") };
   },
 };
+
+async function resolveSingleConflict(id: number, content: string, ctx: Parameters<ToolDefinition["run"]>[1]): Promise<string> {
+  const entry = ctx.conflicts.get(id);
+  if (!entry) throw new Error(`Conflict #${id} not found. Re-read the file or use <path>:conflicts to register current conflicts.`);
+  const resolved = await resolveConflictEntry(entry, content, ctx);
+  return `Resolved conflict #${entry.id} in ${entry.displayPath}.\n\n${resolved}`;
+}
+
+async function resolveAllConflicts(content: string, ctx: Parameters<ToolDefinition["run"]>[1]): Promise<string> {
+  const entries = ctx.conflicts.entries();
+  if (!entries.length) throw new Error("No registered conflicts. Read a conflicted file or <path>:conflicts first.");
+
+  const byPath = new Map<string, ConflictEntry[]>();
+  for (const entry of entries) {
+    const list = byPath.get(entry.path) ?? [];
+    list.push(entry);
+    byPath.set(entry.path, list);
+  }
+
+  const summaries: string[] = [];
+  let resolvedCount = 0;
+  for (const [path, pathEntries] of byPath) {
+    let fileContent = await readOpenDocumentText(await resolveWorkspaceFile(path), Number.MAX_SAFE_INTEGER);
+    const resolvedIds: number[] = [];
+    for (const entry of pathEntries.sort((left, right) => right.startLine - left.startLine)) {
+      const replacement = expandConflictTokens(content, entry);
+      fileContent = spliceConflict(fileContent, entry, replacement);
+      resolvedIds.push(entry.id);
+    }
+    const uri = await resolveWorkspaceFile(path);
+    await writeText(uri, fileContent);
+    for (const id of resolvedIds) ctx.conflicts.remove(id);
+    resolvedCount += resolvedIds.length;
+    summaries.push(`${path}: ${resolvedIds.length} conflict${resolvedIds.length === 1 ? "" : "s"}`);
+  }
+
+  return [`Resolved ${resolvedCount} conflict${resolvedCount === 1 ? "" : "s"} across ${summaries.length} file${summaries.length === 1 ? "" : "s"}:`, ...summaries.map((item) => `- ${item}`)].join("\n");
+}
+
+async function resolveConflictEntry(entry: ConflictEntry, content: string, ctx: Parameters<ToolDefinition["run"]>[1]): Promise<string> {
+  const uri = await resolveWorkspaceFile(entry.path);
+  const original = await readOpenDocumentText(uri, Number.MAX_SAFE_INTEGER);
+  const replacement = expandConflictTokens(content, entry);
+  const next = spliceConflict(original, entry, replacement);
+  await writeText(uri, next);
+  ctx.conflicts.remove(entry.id);
+  const path = relativePath(uri);
+  const snapshot = ctx.snapshots.record(path, next);
+  const diagnostics = await postMutationDiagnostics(uri, { settingKey: "write.diagnosticsOnWrite" });
+  return [diagnostics, renderAnchoredFileWithTag(path, next, snapshot.tag)].filter((item): item is string => Boolean(item)).join("\n\n");
+}
 
 function parseWriteInput(args: string): WriteInput {
   const trimmed = args.trimStart();
@@ -161,10 +237,9 @@ function stripHashlineDisplay(content: string): { content: string; stripped: boo
   return { content: stripped.join("\n"), stripped: true };
 }
 
-async function runPostWriteHooks(uri: vscode.Uri, displayPath: string): Promise<{ content?: string; formatted: boolean; diagnostics?: string; madeExecutable: boolean }> {
+async function runPostWriteHooks(uri: vscode.Uri): Promise<{ content?: string; formatted: boolean; diagnostics?: string; madeExecutable: boolean }> {
   const config = vscode.workspace.getConfiguration("alpha");
   const formatOnWrite = config.get<boolean>("write.formatOnWrite", false);
-  const diagnosticsOnWrite = config.get<boolean>("write.diagnosticsOnWrite", true);
   let formatted = false;
   let document = await vscode.workspace.openTextDocument(uri);
 
@@ -185,9 +260,8 @@ async function runPostWriteHooks(uri: vscode.Uri, displayPath: string): Promise<
     }
   }
 
-  await vscode.window.showTextDocument(uri, { preview: false });
   const madeExecutable = await maybeMarkExecutable(uri, document.getText());
-  const diagnostics = diagnosticsOnWrite ? formatDiagnostics(displayPath, vscode.languages.getDiagnostics(uri)) : undefined;
+  const diagnostics = await postMutationDiagnostics(uri, { settingKey: "write.diagnosticsOnWrite" });
   return { content: document.getText(), formatted, diagnostics, madeExecutable };
 }
 
@@ -203,24 +277,4 @@ async function maybeMarkExecutable(uri: vscode.Uri, content: string): Promise<bo
   } catch {
     return false;
   }
-}
-
-function formatDiagnostics(displayPath: string, diagnostics: vscode.Diagnostic[]): string | undefined {
-  if (!diagnostics.length) return undefined;
-  const bySeverity = new Map<vscode.DiagnosticSeverity, number>();
-  for (const diagnostic of diagnostics) {
-    bySeverity.set(diagnostic.severity, (bySeverity.get(diagnostic.severity) ?? 0) + 1);
-  }
-  const summary = [
-    `${bySeverity.get(vscode.DiagnosticSeverity.Error) ?? 0} errors`,
-    `${bySeverity.get(vscode.DiagnosticSeverity.Warning) ?? 0} warnings`,
-    `${bySeverity.get(vscode.DiagnosticSeverity.Information) ?? 0} info`,
-    `${bySeverity.get(vscode.DiagnosticSeverity.Hint) ?? 0} hints`,
-  ].join(", ");
-  const examples = diagnostics.slice(0, 8).map((diagnostic) => {
-    const line = diagnostic.range.start.line + 1;
-    const column = diagnostic.range.start.character + 1;
-    return `- ${displayPath}:${line}:${column} ${diagnostic.message}`;
-  });
-  return [`Diagnostics after write: ${summary}.`, ...examples].join("\n");
 }

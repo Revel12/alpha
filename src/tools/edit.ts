@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { ensureToolPermission } from "../approval";
 import { editApproval, editApprovalDetails } from "../approvalCore";
 import { applyWorkspaceEdits, buildWorkspaceEdits } from "../patch/hashline";
+import { assertPlanModeWriteAllowed } from "../planMode";
+import { postMutationDiagnostics } from "../postMutationDiagnostics";
 import type { ToolDefinition } from "../types";
 import { readOpenDocumentText, relativePath } from "../workspace";
 
@@ -9,6 +11,7 @@ export const editTool: ToolDefinition = {
   name: "edit",
   summary: "Apply OMP-style hashline edits directly after validating snapshot tags and ranges.",
   async run(args, ctx) {
+    assertPlanModeWriteAllowed("workspace edit", ctx);
     await ensureToolPermission(
       { name: "edit", approval: editApproval, formatApprovalDetails: editApprovalDetails },
       { input: args },
@@ -29,12 +32,15 @@ export const editTool: ToolDefinition = {
 
     const changedUris = uniqueUris(edits.map((edit) => edit.uri));
     const snapshots: string[] = [];
+    const diagnostics: string[] = [];
     let anyChanged = false;
     for (const uri of changedUris) {
       const path = relativePath(uri);
       const next = await readOpenDocumentText(uri, maxBytes);
       if (before.get(uri.toString()) !== next) {
         anyChanged = true;
+        const diagnostic = await postMutationDiagnostics(uri, { settingKey: "edit.diagnosticsOnEdit" });
+        if (diagnostic) diagnostics.push(`[${path}]\n${diagnostic}`);
       }
       const snapshot = ctx.snapshots.record(path, next);
       snapshots.push([
@@ -47,7 +53,7 @@ export const editTool: ToolDefinition = {
       throw new Error("Edits parsed and applied cleanly, but produced no change. Re-read the file before issuing another edit.");
     }
 
-    return { markdown: snapshots.join("\n\n") };
+    return { markdown: [...snapshots, ...diagnostics].join("\n\n") };
   },
 };
 

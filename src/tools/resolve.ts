@@ -1,14 +1,18 @@
 import * as vscode from "vscode";
 import { contentTag } from "../hash";
+import { resolveInternalUrl } from "../internalUrls";
 import { applyWorkspaceEdits } from "../patch/hashline";
+import { DEFAULT_PLAN_FILE, isPlanModeActive, renderPlanReview, updatePlanMode } from "../planMode";
 import type { ToolDefinition } from "../types";
 import { readOpenDocumentText, relativePath, resolveWorkspaceFile } from "../workspace";
 
 interface ResolveInput {
-  action: "apply" | "discard";
+  action: "apply" | "refine" | "discard";
   reason: string;
   extra?: {
     id?: string;
+    title?: string;
+    planPath?: string;
   };
 }
 
@@ -17,6 +21,10 @@ export const resolveTool: ToolDefinition = {
   summary: "Hidden tool that applies or discards pending preview work.",
   async run(args, ctx) {
     const input = parseResolveInput(args);
+    if (isPlanModeActive(ctx) && !input.extra?.id) {
+      return await resolvePlanMode(input, ctx);
+    }
+
     const pending = input.extra?.id ? ctx.pendingEdits.get(input.extra.id) : ctx.pendingEdits.list()[0];
 
     if (!pending) {
@@ -82,8 +90,8 @@ function parseResolveInput(args: string): ResolveInput {
   const trimmed = args.trim();
   if (trimmed.startsWith("{")) {
     const parsed = JSON.parse(trimmed) as Partial<ResolveInput>;
-    if (parsed.action !== "apply" && parsed.action !== "discard") {
-      throw new Error("resolve action must be apply or discard.");
+    if (parsed.action !== "apply" && parsed.action !== "refine" && parsed.action !== "discard") {
+      throw new Error("resolve action must be apply, refine, or discard.");
     }
     if (!parsed.reason?.trim()) {
       throw new Error("resolve reason is required.");
@@ -106,5 +114,72 @@ function parseLegacyResolveInput(input: string): ResolveInput {
     return { action: "apply", reason: "Legacy resolve apply request.", extra: { id: parts[1] } };
   }
 
-  throw new Error("resolve action must be apply or discard.");
+  throw new Error("resolve action must be apply, refine, or discard.");
+}
+
+async function resolvePlanMode(input: ResolveInput, ctx: Parameters<ToolDefinition["run"]>[1]) {
+  const state = ctx.planMode;
+  if (!state?.active) throw new Error("Plan mode is not active.");
+
+  if (input.action === "discard") {
+    ctx.planMode = updatePlanMode(state, { active: false, approvedPlan: undefined, approvedPlanPath: undefined, pendingApproval: false });
+    ctx.persistSession?.();
+    return { markdown: `Discarded Alpha plan mode. Reason: ${input.reason}` };
+  }
+
+  if (input.action === "refine") {
+    ctx.planMode = updatePlanMode(state, { pendingApproval: false });
+    ctx.persistSession?.();
+    return { markdown: `Continuing Alpha plan mode. Reason: ${input.reason}\n\nUpdate \`${ctx.planMode.planPath}\` and call \`resolve\` with \`action: "apply"\` when ready.` };
+  }
+
+  const planPath = normalizedPlanPath(input.extra?.planPath || state.planPath || planPathFromTitle(input.extra?.title) || DEFAULT_PLAN_FILE);
+  const plan = await readPlanText(planPath, ctx);
+  ctx.planMode = updatePlanMode(state, {
+    active: true,
+    approvedPlan: plan,
+    approvedPlanPath: planPath,
+    planPath,
+    pendingApproval: true,
+  });
+  ctx.persistSession?.();
+
+  return {
+    markdown: [
+      "Plan submitted for user approval in chat. Alpha remains in read-only plan mode.",
+      "",
+      `Reason: ${input.reason}`,
+      "",
+      renderPlanReview(ctx.planMode),
+      "",
+      "Type one of:",
+      "- `approve and implement`",
+      "- `refine: <what to change>`",
+      "- `discard plan`",
+    ].join("\n"),
+    details: { stopAfterToolResult: true },
+  };
+}
+
+async function readPlanText(planPath: string, ctx: Parameters<ToolDefinition["run"]>[1]): Promise<string> {
+  try {
+    const resource = await resolveInternalUrl(planPath, ctx);
+    if (!resource.content.trim()) throw new Error("empty plan");
+    return resource.content;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read plan at ${planPath}: ${message}. Write the plan to local:// first, then call resolve apply.`);
+  }
+}
+
+function normalizedPlanPath(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return DEFAULT_PLAN_FILE;
+  return trimmed.startsWith("local://") ? trimmed : `local://${trimmed.replace(/^\/+/, "")}`;
+}
+
+function planPathFromTitle(title: string | undefined): string | undefined {
+  if (!title?.trim()) return undefined;
+  const slug = title.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  return slug ? `local://${slug}-plan.md` : undefined;
 }

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { includeGlobsForSearch, parseSearchInput, renderSearchResults, searchText, truncateSearchOutput } from "../searchCore";
 import type { SearchFileResult } from "../searchCore";
+import { isInternalUrlPath, resolveInternalUrl } from "../internalUrls";
 import type { ToolDefinition } from "../types";
 import { readText, relativePath } from "../workspace";
 
@@ -17,7 +18,9 @@ export const searchTool: ToolDefinition = {
     const maxFiles = config.get<number>("search.maxFiles", 4000);
     const maxReadBytes = config.get<number>("read.maxBytes", 200000);
     const maxVisibleBytes = config.get<number>("search.maxVisibleBytes", 120000);
-    const includes = includeGlobsForSearch(input);
+    const internalPaths = input.paths.filter(isInternalUrlPath);
+    const workspacePaths = input.paths.filter((path) => !isInternalUrlPath(path));
+    const includes = input.paths.length > 0 && workspacePaths.length === 0 ? [] : includeGlobsForSearch({ paths: workspacePaths });
     const uniqueFiles = new Map<string, vscode.Uri>();
     for (const include of includes) {
       const found = await vscode.workspace.findFiles(include, "**/{node_modules,out,dist,build,.git,coverage,target,vendor}/**", maxFiles + input.skip);
@@ -46,6 +49,20 @@ export const searchTool: ToolDefinition = {
       const path = relativePath(uri);
       const snapshot = ctx.snapshots.record(path, text);
       const result = searchText(path, snapshot.tag, text, input, input.maxResults - matchCount);
+      if (!result) continue;
+      matchCount += result.matchCount;
+      if (matchCount >= input.maxResults) limited = true;
+      results.push(result);
+    }
+
+    for (const internalPath of internalPaths) {
+      if (matchCount >= input.maxResults) {
+        limited = true;
+        break;
+      }
+      const resource = await resolveInternalUrl(internalPath, ctx);
+      const snapshot = ctx.snapshots.record(resource.url, resource.content);
+      const result = searchText(resource.url, snapshot.tag, resource.content, input, input.maxResults - matchCount);
       if (!result) continue;
       matchCount += result.matchCount;
       if (matchCount >= input.maxResults) limited = true;
