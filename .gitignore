@@ -1,6 +1,7 @@
 node_modules/
 out/
 .vscode-test/
+.alpha/
 *.vsix
 .DS_Store
 README.md

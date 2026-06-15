@@ -198,6 +198,11 @@
           "maximum": 365,
           "description": "Automatically prune persisted Alpha sessions that have not been touched for this many days."
         },
+        "alpha.session.storagePath": {
+          "type": "string",
+          "default": ".alpha/sessions.json",
+          "description": "File path for persisted Alpha session state. Relative paths resolve from the first workspace folder; use an absolute path for a stable VDI-backed profile location."
+        },
         "alpha.context.showUsage": {
           "type": "boolean",
           "default": false,

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -36,6 +37,7 @@ import { workspaceFolders } from "./workspace";
 
 const STORAGE_KEY = "alpha.sessions.v1";
 const MAX_PERSISTED_SESSIONS = 25;
+const DEFAULT_SESSION_STORAGE_PATH = ".alpha/sessions.json";
 
 export interface AlphaSessionState {
   key: string;
@@ -194,10 +196,13 @@ export class AlphaSessionManager {
     this.byKey.clear();
     this.latestKey = undefined;
     void this.extensionContext.workspaceState.update(STORAGE_KEY, undefined);
+    deleteSessionStorageFile(this.extensionContext);
   }
 
   persistNow(): void {
-    void this.extensionContext.workspaceState.update(STORAGE_KEY, this.toPersisted());
+    const persisted = this.toPersisted();
+    writeSessionStorageFile(this.extensionContext, persisted);
+    void this.extensionContext.workspaceState.update(STORAGE_KEY, persisted);
   }
 
   private touch(state: AlphaSessionState): void {
@@ -210,13 +215,16 @@ export class AlphaSessionManager {
   }
 
   private restore(): void {
-    const persisted = this.extensionContext.workspaceState.get<PersistedSessionRoot>(STORAGE_KEY);
+    const filePersisted = readSessionStorageFile(this.extensionContext);
+    const workspacePersisted = this.extensionContext.workspaceState.get<PersistedSessionRoot>(STORAGE_KEY);
+    const persisted = newestPersistedRoot(filePersisted, workspacePersisted);
     if (!persisted?.sessions?.length) return;
     for (const raw of prunePersistedSessions(persisted.sessions).slice(0, MAX_PERSISTED_SESSIONS)) {
       const state = createSessionState(raw.key, raw.label, () => this.persistSoon(), raw, artifactDirForSession(this.extensionContext, raw.key));
       this.byKey.set(state.key, state);
     }
     this.latestKey = persisted.latestKey && this.byKey.has(persisted.latestKey) ? persisted.latestKey : this.list()[0]?.key;
+    this.persistSoon();
   }
 
   private toPersisted(): PersistedSessionRoot {
@@ -227,6 +235,72 @@ export class AlphaSessionManager {
       sessions,
     };
   }
+}
+
+function readSessionStorageFile(extensionContext: vscode.ExtensionContext): PersistedSessionRoot | undefined {
+  const filePath = sessionStorageFilePath(extensionContext);
+  try {
+    if (!fs.existsSync(filePath)) return undefined;
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+    if (!isPersistedSessionRoot(parsed)) return undefined;
+    return parsed;
+  } catch (error) {
+    console.warn(`Alpha could not read session storage file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+function writeSessionStorageFile(extensionContext: vscode.ExtensionContext, persisted: PersistedSessionRoot): void {
+  const filePath = sessionStorageFilePath(extensionContext);
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpPath, `${JSON.stringify(persisted, undefined, 2)}\n`, "utf8");
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    console.warn(`Alpha could not write session storage file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function deleteSessionStorageFile(extensionContext: vscode.ExtensionContext): void {
+  const filePath = sessionStorageFilePath(extensionContext);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (error) {
+    console.warn(`Alpha could not delete session storage file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function sessionStorageFilePath(extensionContext: vscode.ExtensionContext): string {
+  const configured = vscode.workspace.getConfiguration("alpha").get<string>("session.storagePath", DEFAULT_SESSION_STORAGE_PATH).trim() || DEFAULT_SESSION_STORAGE_PATH;
+  if (path.isAbsolute(configured)) return configured;
+
+  const [firstWorkspace] = workspaceFolders();
+  if (firstWorkspace) return path.join(firstWorkspace.uri.fsPath, configured);
+
+  return path.join(extensionContext.globalStorageUri.fsPath, configured);
+}
+
+function newestPersistedRoot(
+  left: PersistedSessionRoot | undefined,
+  right: PersistedSessionRoot | undefined,
+): PersistedSessionRoot | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return newestSessionTimestamp(right) > newestSessionTimestamp(left) ? right : left;
+}
+
+function newestSessionTimestamp(root: PersistedSessionRoot): number {
+  return root.sessions.reduce((newest, session) => {
+    const touchedMs = Date.parse(session.updatedAt);
+    return Number.isFinite(touchedMs) ? Math.max(newest, touchedMs) : newest;
+  }, 0);
+}
+
+function isPersistedSessionRoot(value: unknown): value is PersistedSessionRoot {
+  if (!value || typeof value !== "object") return false;
+  const root = value as Partial<PersistedSessionRoot>;
+  return root.version === 1 && Array.isArray(root.sessions);
 }
 
 function createSessionState(
