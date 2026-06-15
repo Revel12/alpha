@@ -181,6 +181,15 @@ import {
   renderPlanReview,
 } from "../out/planMode.js";
 import {
+  appendBlueprintAnswer,
+  assertBlueprintWriteAllowed,
+  blueprintModeSystemPrompt,
+  buildBlueprintGeneratePrompt,
+  createBlueprintModeState,
+  isBlueprintGeneratePrompt,
+  renderBlueprintStatus,
+} from "../out/blueprintMode.js";
+import {
   applyJsonPath,
   parseJsonPath,
 } from "../out/jsonPath.js";
@@ -1573,6 +1582,60 @@ test("plan mode blocks workspace writes and allows local plan artifacts", () => 
   assert.throws(
     () => assertPlanModeWriteAllowed("src/app.ts", ctx),
     /Plan mode keeps the workspace read-only/,
+  );
+});
+
+test("blueprint mode exposes read-only planning tools with task fanout", () => {
+  const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("scope a risky auth refactor") });
+  const names = getAdvertisedAlphaLanguageModelTools({ ctx, includeDiscoverable: true }).map((tool) => tool.name);
+
+  assert.deepEqual(names, ["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo"]);
+  assert.equal(names.includes("edit"), false);
+  assert.equal(names.includes("resolve"), false);
+});
+
+test("blueprint mode prompts Q&A and read-only explore subagents before plan generation", () => {
+  const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("replace the settings storage layer") });
+  const prompt = blueprintModeSystemPrompt(ctx);
+
+  assert.match(prompt, /Blueprint mode is read-only/);
+  assert.match(prompt, /parallel read-only `explore` subagents/);
+  assert.match(prompt, /agent: "explore"/);
+  assert.match(prompt, /Ask 3-5 concise questions/);
+  assert.match(prompt, /Do not implement code/);
+  assert.match(prompt, /Do not generate the plan before that command/);
+});
+
+test("blueprint mode records answers in the refined prompt and status", () => {
+  const state = appendBlueprintAnswer(
+    createBlueprintModeState("add project import"),
+    "CSV and JSON should both be supported; keep existing imports compatible.",
+  );
+
+  assert.equal(state.rounds.length, 1);
+  assert.match(state.refinedPrompt, /User answers and refinements:/);
+  assert.match(state.refinedPrompt, /CSV and JSON should both be supported/);
+  assert.match(renderBlueprintStatus(state), /Answer rounds: 1/);
+});
+
+test("blueprint generate prompt hands the refined request to plan mode", () => {
+  const state = appendBlueprintAnswer(createBlueprintModeState("build export flow", "concise"), "Prefer the existing artifact store.");
+  const prompt = buildBlueprintGeneratePrompt(state);
+
+  assert.match(prompt, /Generate an Alpha execution plan/);
+  assert.match(prompt, /concise plan template/);
+  assert.match(prompt, /Write the plan to the active Alpha plan file/);
+  assert.match(prompt, /Prefer the existing artifact store/);
+  assert.equal(isBlueprintGeneratePrompt("ready to generate the plan"), true);
+});
+
+test("blueprint mode blocks workspace writes and allows local notes", () => {
+  const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("draft a blueprint") });
+
+  assert.doesNotThrow(() => assertBlueprintWriteAllowed("local://alpha-blueprint.md", ctx));
+  assert.throws(
+    () => assertBlueprintWriteAllowed("src/app.ts", ctx),
+    /Blueprint mode keeps the workspace read-only/,
   );
 });
 

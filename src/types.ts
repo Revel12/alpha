@@ -24,6 +24,7 @@ export interface AlphaContext {
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
   planMode?: PlanModeState;
+  blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;
   taskDepth?: number;
   taskAllowedSpawns?: string[] | "*" | "";
@@ -167,6 +168,22 @@ export interface PlanModeState {
   approvedPlan?: string;
   approvedPlanPath?: string;
   pendingApproval?: boolean;
+}
+
+export interface BlueprintRound {
+  answer: string;
+  createdAt: string;
+}
+
+export interface BlueprintModeState {
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+  template: "default" | "concise";
+  blueprintPath: string;
+  originalPrompt: string;
+  refinedPrompt: string;
+  rounds: BlueprintRound[];
 }
 
 export type GoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";

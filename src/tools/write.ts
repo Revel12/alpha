@@ -3,6 +3,7 @@ import * as pathModule from "node:path";
 import * as vscode from "vscode";
 import { ensureToolPermission } from "../approval";
 import { writeApproval, writeApprovalDetails } from "../approvalCore";
+import { assertBlueprintWriteAllowed } from "../blueprintMode";
 import {
   expandConflictTokens,
   parseConflictUri,
@@ -30,6 +31,7 @@ export const writeTool: ToolDefinition = {
   summary: "Write a workspace file, internal URL, archive member, or SQLite row.",
   async run(args, ctx) {
     const input = parseWriteInput(args);
+    assertBlueprintWriteAllowed(input.path, ctx);
     assertPlanModeWriteAllowed(input.path, ctx);
     await ensureToolPermission(
       { name: "write", approval: writeApproval, formatApprovalDetails: writeApprovalDetails },

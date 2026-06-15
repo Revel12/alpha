@@ -44,6 +44,14 @@
             "description": "Show the current Alpha plan mode review state."
           },
           {
+            "name": "blueprint",
+            "description": "Run Blueprint-style Q&A before generating an Alpha plan."
+          },
+          {
+            "name": "blueprint-generate",
+            "description": "Generate an Alpha plan from the active blueprint."
+          },
+          {
             "name": "goal",
             "description": "Manage an OMP-style persistent Alpha goal."
           },

@@ -1,5 +1,6 @@
 import type * as vscode from "vscode";
 import { BITBUCKET_OPS } from "./bitbucketCore";
+import { isBlueprintModeActive } from "./blueprintMode";
 import { isPlanModeActive } from "./planMode";
 import { schemaKeys } from "./toolDiscoveryCore";
 import type { DiscoverableTool } from "./toolDiscoveryCore";
@@ -30,6 +31,7 @@ export interface AlphaToolSelection {
 
 export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "bash", "edit"] as const;
 const PLAN_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo", "resolve"]);
+const BLUEPRINT_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo"]);
 
 const stringProperty = (description: string): object => ({ type: "string", description });
 const alwaysEnabled = (): boolean => true;
@@ -534,6 +536,7 @@ export function getAdvertisedAlphaTools(selection: AlphaToolSelection = {}): Alp
 
   return alphaToolRegistry.filter((tool) => {
     if (!tool.enabled(selection.ctx)) return false;
+    if (isBlueprintModeActive(selection.ctx) && !BLUEPRINT_MODE_TOOL_NAMES.has(tool.name)) return false;
     if (isPlanModeActive(selection.ctx) && !PLAN_MODE_TOOL_NAMES.has(tool.name)) return false;
     if (selection.onlyForced) return forced.has(tool.name);
     if (forced.has(tool.name)) return true;

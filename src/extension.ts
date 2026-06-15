@@ -5,6 +5,16 @@ import type { AlphaSessionState } from "./sessionState";
 import { buildAlphaTranscript } from "./transcript";
 import type { AlphaContext } from "./types";
 import { alphaContextUsageForPrompt, answerWithAlphaTools } from "./lmTools";
+import {
+  appendBlueprintAnswer,
+  buildBlueprintGeneratePrompt,
+  createBlueprintModeState,
+  deactivateBlueprintMode,
+  isBlueprintGeneratePrompt,
+  parseBlueprintTemplate,
+  renderBlueprintStatus,
+  setBlueprintTemplate,
+} from "./blueprintMode";
 import { runAlphaCommit } from "./commitWorkflow";
 import { compactTranscriptWithModel, compactableTranscriptEntries, formatContextUsage } from "./contextManager";
 import {
@@ -151,6 +161,7 @@ async function handleAlphaRequest(
     permissionDecisions: session.permissionDecisions,
     discoveredTools: session.discoveredTools,
     planMode: session.planMode,
+    blueprintMode: session.blueprintMode,
     goalMode: session.goalMode,
     persistSession: () => sessions.persistNow(),
     setCompaction: (summary, compactedThroughHistoryIndex) => {
@@ -201,9 +212,23 @@ async function handleAlphaRequest(
       return;
     }
 
+    if (parsedRequest.command === "blueprint") {
+      await handleBlueprintCommand(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
+    if (parsedRequest.command === "blueprint-generate") {
+      await generatePlanFromBlueprint(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
     if (parsedRequest.command === "plan") {
       if (session.goalMode?.enabled) {
         stream.markdown("Exit or complete the active Alpha goal before entering plan mode.");
+        return;
+      }
+      if (session.blueprintMode?.active) {
+        stream.markdown("Generate or discard the active Alpha blueprint before entering plan mode.");
         return;
       }
       await handlePlanCommand(parsedRequest.prompt, session, alphaContext);
@@ -218,6 +243,15 @@ async function handleAlphaRequest(
     if (!parsedRequest.command && session.planMode && (session.planMode.pendingApproval || session.planMode.approvedPlan)) {
       const handled = await handlePlanDecisionPrompt(parsedRequest.prompt, session, alphaContext);
       if (handled) return;
+    }
+
+    if (!parsedRequest.command && session.blueprintMode?.active) {
+      if (isBlueprintGeneratePrompt(parsedRequest.prompt)) {
+        await generatePlanFromBlueprint(parsedRequest.prompt, session, alphaContext);
+      } else {
+        await continueBlueprint(parsedRequest.prompt, session, alphaContext);
+      }
+      return;
     }
 
     const expandedPrompt = await expandAlphaCommand(parsedRequest);
@@ -292,6 +326,129 @@ async function handleGoalCommand(
     ctx.setGoalMode?.(undefined);
     ctx.stream.markdown(dropped ? renderGoalToolResponse(goalToolResponse("drop", dropped)) : "No active goal.");
   }
+}
+
+async function handleBlueprintCommand(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  const trimmed = prompt.trim();
+  if (session.planMode?.active || session.planMode?.pendingApproval) {
+    ctx.stream.markdown("Exit or finish Alpha plan mode before starting a blueprint.");
+    return;
+  }
+  if (session.goalMode?.enabled) {
+    ctx.stream.markdown("Exit or complete the active Alpha goal before starting a blueprint.");
+    return;
+  }
+
+  if (isBlueprintDiscardPrompt(trimmed)) {
+    session.blueprintMode = undefined;
+    ctx.blueprintMode = undefined;
+    sessions.persistNow();
+    ctx.stream.markdown("Discarded Alpha blueprint.");
+    return;
+  }
+
+  if (trimmed === "status" || trimmed === "review" || trimmed === "show") {
+    ctx.stream.markdown(renderBlueprintStatus(session.blueprintMode));
+    return;
+  }
+
+  const template = parseBlueprintTemplate(trimmed);
+  if (template && session.blueprintMode?.active && /^template\b/i.test(trimmed)) {
+    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, template);
+    ctx.blueprintMode = session.blueprintMode;
+    sessions.persistNow();
+    ctx.stream.markdown(renderBlueprintStatus(session.blueprintMode));
+    return;
+  }
+
+  if (session.blueprintMode?.active) {
+    await continueBlueprint(trimmed, session, ctx);
+    return;
+  }
+
+  if (!trimmed) {
+    ctx.stream.markdown("Start a blueprint with `@a /blueprint <request>`. Use `/blueprint-generate` when the Q&A is ready to become an Alpha plan.");
+    return;
+  }
+
+  session.blueprintMode = createBlueprintModeState(trimmed, template ?? "default");
+  ctx.blueprintMode = session.blueprintMode;
+  sessions.persistNow();
+  await answerWithAlphaTools(buildBlueprintStartPrompt(session.blueprintMode.refinedPrompt), ctx);
+}
+
+async function continueBlueprint(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  if (!session.blueprintMode?.active) {
+    ctx.stream.markdown("No active Alpha blueprint. Start one with `@a /blueprint <request>`.");
+    return;
+  }
+  const template = parseBlueprintTemplate(prompt);
+  if (template && /^template\b/i.test(prompt)) {
+    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, template);
+  } else {
+    session.blueprintMode = appendBlueprintAnswer(session.blueprintMode, prompt);
+  }
+  ctx.blueprintMode = session.blueprintMode;
+  sessions.persistNow();
+  await answerWithAlphaTools(buildBlueprintContinuePrompt(prompt), ctx);
+}
+
+async function generatePlanFromBlueprint(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  const blueprint = session.blueprintMode;
+  if (!blueprint?.active) {
+    ctx.stream.markdown("No active Alpha blueprint to generate from.");
+    return;
+  }
+  if (session.planMode?.active || session.planMode?.pendingApproval) {
+    ctx.stream.markdown("A plan is already active or waiting for approval.");
+    return;
+  }
+
+  const template = parseBlueprintTemplate(prompt);
+  const nextBlueprint = deactivateBlueprintMode(template ? setBlueprintTemplate(blueprint, template) : blueprint);
+  session.blueprintMode = nextBlueprint;
+  ctx.blueprintMode = nextBlueprint;
+  session.planMode = createPlanModeState(nextBlueprint.refinedPrompt);
+  ctx.planMode = session.planMode;
+  sessions.persistNow();
+
+  await answerWithAlphaTools(buildBlueprintGeneratePrompt(nextBlueprint), ctx);
+}
+
+function buildBlueprintStartPrompt(refinedPrompt: string): string {
+  return [
+    "Start Alpha Blueprint mode for this request.",
+    "Investigate enough to ask useful questions. Use read-only explore subagents with task fanout when the work is broad.",
+    "Ask the first 3-5 clarifying questions unless the request is already fully specified. Do not generate the plan yet.",
+    "",
+    refinedPrompt,
+  ].join("\n");
+}
+
+function buildBlueprintContinuePrompt(userAnswer: string): string {
+  return [
+    "Continue Alpha Blueprint mode with this user answer or refinement.",
+    "Update your understanding, investigate further if needed, then either ask the next 3-5 useful questions or say the blueprint is ready for `/blueprint-generate`.",
+    "Do not generate the plan yet.",
+    "",
+    userAnswer,
+  ].join("\n");
+}
+
+function isBlueprintDiscardPrompt(prompt: string): boolean {
+  return /\b(discard|cancel|abandon|drop|clear)\b/i.test(prompt);
 }
 
 async function compactAlphaSession(

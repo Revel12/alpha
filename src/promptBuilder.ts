@@ -1,5 +1,6 @@
 import { getAdvertisedAlphaTools } from "./toolRegistry";
 import type { AlphaToolSelection } from "./toolRegistry";
+import { blueprintModeSystemPrompt } from "./blueprintMode";
 import { goalModeSystemPrompt } from "./goalMode";
 import { planModeSystemPrompt } from "./planMode";
 import type { AlphaContext } from "./types";
@@ -13,10 +14,12 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
         `- label: ${ctx.sessionLabel}`,
         `- key: ${ctx.sessionKey}`,
         ctx.compactionSummary ? `- compacted context: ${ctx.compactionSummary}` : undefined,
+        ctx.blueprintMode?.active ? "- mode: blueprint" : undefined,
         ctx.planMode?.active ? "- mode: plan" : undefined,
         "",
       ].filter((line): line is string => typeof line === "string")
     : [];
+  const blueprintLines = ctx ? blueprintModeSystemPrompt(ctx) : undefined;
   const planLines = ctx ? planModeSystemPrompt(ctx) : undefined;
   const goalLines = ctx ? goalModeSystemPrompt(ctx.goalMode) : undefined;
   const approvedPlanLines = ctx?.planMode?.approvedPlan && !ctx.planMode.active
@@ -36,6 +39,7 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "",
     ...sessionLines,
     ...(goalLines ? [goalLines, ""] : []),
+    ...(blueprintLines ? [blueprintLines, ""] : []),
     ...(planLines ? [planLines, ""] : []),
     ...(approvedPlanLines ? [approvedPlanLines, ""] : []),
     "TOOLS",
