@@ -11,7 +11,7 @@ import {
   InMemoryPermissionDecisionStore,
   InMemoryTodoStore,
 } from "./store";
-import { buildAlphaTranscript, firstUserPromptFromTranscript } from "./transcript";
+import { buildAlphaTranscript, firstUserPromptFromTranscript, type AlphaTranscriptEntry } from "./transcript";
 import type {
   Artifact,
   ArtifactStore,
@@ -52,6 +52,7 @@ export interface AlphaSessionState {
   conflicts: ConflictStore;
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
+  terminalTranscript?: AlphaTranscriptEntry[];
   planMode?: PlanModeState;
   blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;
@@ -85,6 +86,91 @@ export class AlphaSessionManager {
     this.byContext.set(chatContext, state);
     this.latestKey = state.key;
     return state;
+  }
+
+  getTerminal(key?: string): AlphaSessionState {
+    const baseKey = terminalBaseKey();
+    const requested = key && isTerminalSessionKey(key, baseKey) ? this.byKey.get(key) : undefined;
+    if (requested) {
+      this.touch(requested);
+      this.latestKey = requested.key;
+      return requested;
+    }
+
+    const newest = this.terminalSessions()[0];
+    if (newest) {
+      this.touch(newest);
+      this.latestKey = newest.key;
+      return newest;
+    }
+
+    let state = this.byKey.get(baseKey);
+    if (!state) {
+      state = createSessionState(baseKey, "Alpha terminal", () => this.persistSoon(), undefined, artifactDirForSession(this.extensionContext, baseKey));
+      state.terminalTranscript = [];
+      this.byKey.set(baseKey, state);
+      this.persistSoon();
+    }
+    this.touch(state);
+    this.latestKey = state.key;
+    return state;
+  }
+
+  createTerminal(label?: string): AlphaSessionState {
+    const baseKey = terminalBaseKey();
+    const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const key = `${baseKey}:${suffix}`;
+    const state = createSessionState(key, cleanSessionLabel(label) || "Alpha terminal", () => this.persistSoon(), undefined, artifactDirForSession(this.extensionContext, key));
+    state.terminalTranscript = [];
+    this.byKey.set(key, state);
+    this.touch(state);
+    this.latestKey = state.key;
+    return state;
+  }
+
+  terminalSessions(): AlphaSessionState[] {
+    const baseKey = terminalBaseKey();
+    return [...this.byKey.values()]
+      .filter((state) => isTerminalSessionKey(state.key, baseKey))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  renameTerminal(key: string, label: string): AlphaSessionState | undefined {
+    const baseKey = terminalBaseKey();
+    if (!isTerminalSessionKey(key, baseKey)) return undefined;
+    const state = this.byKey.get(key);
+    if (!state) return undefined;
+    state.label = cleanSessionLabel(label) || state.label;
+    this.touch(state);
+    return state;
+  }
+
+  clearTerminal(key: string): AlphaSessionState | undefined {
+    const baseKey = terminalBaseKey();
+    if (!isTerminalSessionKey(key, baseKey)) return undefined;
+    const state = this.byKey.get(key);
+    if (!state) return undefined;
+    state.compactionSummary = undefined;
+    state.compactedThroughHistoryIndex = undefined;
+    state.terminalTranscript = [];
+    state.pendingEdits.clear();
+    state.todos.set([]);
+    state.snapshots.clear();
+    state.artifacts.clear();
+    state.bashJobs.clear();
+    state.conflicts.clear();
+    state.permissionDecisions.clear();
+    state.discoveredTools.clear();
+    state.planMode = undefined;
+    state.blueprintMode = undefined;
+    state.goalMode = undefined;
+    this.touch(state);
+    return state;
+  }
+
+  getTerminalByOrdinal(ordinal: number): AlphaSessionState | undefined {
+    if (!Number.isInteger(ordinal) || ordinal < 1) return undefined;
+    return this.terminalSessions()[ordinal - 1];
   }
 
   latest(): AlphaSessionState | undefined {
@@ -171,6 +257,7 @@ function createSessionState(
     conflicts: new InMemoryConflictStore([], notifyChanged),
     permissionDecisions: new InMemoryPermissionDecisionStore(),
     discoveredTools: new InMemoryDiscoveredToolStore(persisted?.discoveredTools ?? [], notifyChanged),
+    terminalTranscript: persisted?.terminalTranscript,
     planMode: persisted?.planMode,
     blueprintMode: persisted?.blueprintMode,
     goalMode: persisted?.goalMode,
@@ -192,6 +279,7 @@ function toPersistedSession(state: AlphaSessionState): PersistedSession {
     artifacts: state.artifacts.list().map(toPersistedArtifact),
     bashJobs: state.bashJobs.list().map(toPersistedBashJob),
     discoveredTools: state.discoveredTools.list(),
+    terminalTranscript: state.terminalTranscript,
     planMode: state.planMode,
     blueprintMode: state.blueprintMode,
     goalMode: state.goalMode,
@@ -201,6 +289,19 @@ function toPersistedSession(state: AlphaSessionState): PersistedSession {
 function artifactDirForSession(extensionContext: vscode.ExtensionContext, key: string): string {
   const root = extensionContext.storageUri ?? extensionContext.globalStorageUri;
   return path.join(root.fsPath, "alpha-artifacts", sanitizePathSegment(key));
+}
+
+function terminalBaseKey(): string {
+  const workspaceKey = workspaceFolders().map((folder) => folder.uri.toString()).sort().join("|") || "no-workspace";
+  return `${workspaceKey}#terminal`;
+}
+
+function isTerminalSessionKey(key: string, baseKey: string): boolean {
+  return key === baseKey || key.startsWith(`${baseKey}:`);
+}
+
+function cleanSessionLabel(label: string | undefined): string {
+  return (label ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
 function sessionKey(chatContext: vscode.ChatContext, request: vscode.ChatRequest): string {
@@ -258,6 +359,7 @@ interface PersistedSession {
   artifacts?: PersistedArtifact[];
   bashJobs?: BashJob[];
   discoveredTools?: string[];
+  terminalTranscript?: AlphaTranscriptEntry[];
   planMode?: PlanModeState;
   blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;

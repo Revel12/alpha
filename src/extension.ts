@@ -3,6 +3,7 @@ import { applyWorkspaceEdits } from "./patch/hashline";
 import { AlphaSessionManager } from "./sessionState";
 import type { AlphaSessionState } from "./sessionState";
 import { buildAlphaTranscript } from "./transcript";
+import type { AlphaTranscriptEntry } from "./transcript";
 import type { AlphaContext } from "./types";
 import { alphaContextUsageForPrompt, answerWithAlphaTools } from "./lmTools";
 import {
@@ -46,6 +47,7 @@ import { buildInteractiveReviewPrompt } from "./reviewCore";
 import { workspaceRoot } from "./workspace";
 
 let sessions: AlphaSessionManager;
+let alphaTerminal: vscode.Terminal | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   sessions = new AlphaSessionManager(context);
@@ -105,6 +107,29 @@ export function activate(context: vscode.ExtensionContext): void {
       sessions.latest()?.pendingEdits.clear();
       void vscode.window.showInformationMessage("Cleared Alpha pending edits.");
     }),
+    vscode.commands.registerCommand("alpha.openTerminal", async () => {
+      if (alphaTerminal) {
+        alphaTerminal.show();
+        return;
+      }
+      const model = await selectAlphaTerminalModel();
+      if (!model) return;
+      const pty = new AlphaPseudoTerminal(context, model);
+      alphaTerminal = vscode.window.createTerminal({
+        name: "Alpha",
+        iconPath: new vscode.ThemeIcon("hubot"),
+        isTransient: false,
+        pty,
+      });
+      const disposeClose = vscode.window.onDidCloseTerminal((terminal) => {
+        if (terminal === alphaTerminal) {
+          alphaTerminal = undefined;
+          disposeClose.dispose();
+        }
+      });
+      context.subscriptions.push(disposeClose);
+      alphaTerminal.show();
+    }),
     vscode.commands.registerCommand("alpha.inspectVsCodeTools", () => {
       const output = vscode.window.createOutputChannel("Alpha: VS Code LM Tools");
       output.clear();
@@ -135,7 +160,435 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
-  sessions.clear();
+  sessions.persistNow();
+}
+
+class AlphaPseudoTerminal implements vscode.Pseudoterminal {
+  private readonly writeEmitter = new vscode.EventEmitter<string>();
+  private readonly closeEmitter = new vscode.EventEmitter<void>();
+  readonly onDidWrite = this.writeEmitter.event;
+  readonly onDidClose = this.closeEmitter.event;
+
+  private input = "";
+  private history: string[] = [];
+  private historyIndex: number | undefined;
+  private busy = false;
+  private cancellation: vscode.CancellationTokenSource | undefined;
+  private sessionKey: string | undefined;
+
+  constructor(
+    private readonly extensionContext: vscode.ExtensionContext,
+    private readonly model: vscode.LanguageModelChat,
+  ) {}
+
+  open(): void {
+    const session = this.currentSession();
+    this.writeLine(`Alpha terminal 0.0.1`);
+    this.writeLine(`Model: ${this.model.name}`);
+    this.writeLine(`Session: ${session.label}`);
+    this.writeLine("Type `help`, `/sessions`, `/new`, `/resume`, `/context`, `/plan <goal>`, `/goal`, `/compact`, `/review`, or a natural request.");
+    this.writeLine("Type `exit` to close this terminal.");
+    this.writeLine("");
+    this.prompt();
+  }
+
+  close(): void {
+    this.cancellation?.cancel();
+    this.cancellation?.dispose();
+  }
+
+  handleInput(data: string): void {
+    if (data === "\x03") {
+      this.cancelCurrentRequest();
+      return;
+    }
+    if (this.busy) return;
+
+    if (data === "\x1b[A") {
+      this.replaceInput(this.previousHistory());
+      return;
+    }
+    if (data === "\x1b[B") {
+      this.replaceInput(this.nextHistory());
+      return;
+    }
+
+    for (const char of data) {
+      if (char === "\r") {
+        void this.submitInput();
+      } else if (char === "\x7f") {
+        this.backspace();
+      } else if (char >= " " || char === "\t") {
+        this.input += char;
+        this.write(char);
+      }
+    }
+  }
+
+  private async submitInput(): Promise<void> {
+    const raw = this.input;
+    const promptInput = raw.trim();
+    this.input = "";
+    this.historyIndex = undefined;
+    this.writeLine("");
+
+    if (!promptInput) {
+      this.prompt();
+      return;
+    }
+
+    this.history.push(promptInput);
+    if (promptInput === "exit" || promptInput === "/exit" || promptInput === "quit" || promptInput === "/quit") {
+      this.writeLine("Closing Alpha terminal.");
+      this.cancellation?.cancel();
+      this.closeEmitter.fire();
+      return;
+    }
+    if (promptInput === "/clear" || promptInput === "clear") {
+      this.write("\x1b[2J\x1b[3J\x1b[H");
+      this.prompt();
+      return;
+    }
+    if (promptInput === "/history") {
+      this.renderHistory();
+      this.prompt();
+      return;
+    }
+    if (await this.handleSessionCommand(promptInput)) {
+      this.prompt();
+      return;
+    }
+
+    this.busy = true;
+    this.cancellation = new vscode.CancellationTokenSource();
+    const stream = new TerminalResponseStream((text) => this.writeMarkdown(text));
+    const session = this.currentSession();
+    try {
+      await handleAlphaTerminalRequest(this.extensionContext, session, promptInput, this.model, stream.asChatResponseStream(), this.cancellation.token);
+      rememberTerminalTurn(session, promptInput, stream.markdownText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.writeMarkdown(`Alpha terminal error: ${message}`);
+    } finally {
+      this.cancellation.dispose();
+      this.cancellation = undefined;
+      this.busy = false;
+      this.writeLine("");
+      this.prompt();
+    }
+  }
+
+  private cancelCurrentRequest(): void {
+    if (!this.busy) {
+      this.input = "";
+      this.writeLine("^C");
+      this.prompt();
+      return;
+    }
+    this.writeLine("^C");
+    this.cancellation?.cancel();
+  }
+
+  private previousHistory(): string {
+    if (!this.history.length) return this.input;
+    this.historyIndex = this.historyIndex === undefined
+      ? this.history.length - 1
+      : Math.max(0, this.historyIndex - 1);
+    return this.history[this.historyIndex] ?? "";
+  }
+
+  private nextHistory(): string {
+    if (this.historyIndex === undefined) return this.input;
+    this.historyIndex += 1;
+    if (this.historyIndex >= this.history.length) {
+      this.historyIndex = undefined;
+      return "";
+    }
+    return this.history[this.historyIndex] ?? "";
+  }
+
+  private replaceInput(next: string): void {
+    this.write(`\r\x1b[2Kalpha> ${next}`);
+    this.input = next;
+  }
+
+  private backspace(): void {
+    if (!this.input.length) return;
+    this.input = this.input.slice(0, -1);
+    this.write("\b \b");
+  }
+
+  private renderHistory(): void {
+    const session = this.currentSession();
+    const transcript = buildTerminalTranscript(session);
+    if (!transcript.length) {
+      this.writeLine("No Alpha terminal history yet.");
+      return;
+    }
+    for (const entry of transcript) {
+      if (entry.role === "user") this.writeLine(`user: ${entry.content}`);
+      if (entry.role === "assistant") this.writeLine(`alpha: ${entry.content.slice(0, 500)}${entry.content.length > 500 ? "..." : ""}`);
+    }
+  }
+
+  private async handleSessionCommand(input: string): Promise<boolean> {
+    const match = /^\/(new|sessions|session|resume|rename|clear-session)\b(?:\s+([\s\S]*))?$/i.exec(input);
+    if (!match) return false;
+
+    const command = match[1].toLowerCase();
+    const arg = (match[2] ?? "").trim();
+
+    if (command === "new") {
+      const session = sessions.createTerminal(arg || undefined);
+      this.switchSession(session);
+      this.writeLine(`Started Alpha terminal session: ${session.label}`);
+      return true;
+    }
+
+    if (command === "sessions" || command === "session") {
+      this.renderSessions();
+      return true;
+    }
+
+    if (command === "resume") {
+      const session = arg ? this.resolveSessionArgument(arg) : await this.pickSession();
+      if (!session) {
+        this.writeLine("No Alpha terminal session selected.");
+        return true;
+      }
+      this.switchSession(session);
+      this.writeLine(`Resumed Alpha terminal session: ${session.label}`);
+      return true;
+    }
+
+    if (command === "rename") {
+      const nextLabel = arg || await vscode.window.showInputBox({
+        title: "Rename Alpha Terminal Session",
+        prompt: "Session name",
+        value: this.currentSession().label,
+        ignoreFocusOut: true,
+      });
+      if (!nextLabel?.trim()) {
+        this.writeLine("Session rename cancelled.");
+        return true;
+      }
+      const renamed = sessions.renameTerminal(this.currentSession().key, nextLabel);
+      if (renamed) {
+        this.switchSession(renamed);
+        this.writeLine(`Renamed Alpha terminal session: ${renamed.label}`);
+      }
+      return true;
+    }
+
+    if (command === "clear-session") {
+      const cleared = sessions.clearTerminal(this.currentSession().key);
+      if (cleared) {
+        this.switchSession(cleared);
+        this.writeLine(`Cleared Alpha terminal session: ${cleared.label}`);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  private currentSession(): AlphaSessionState {
+    const session = sessions.getTerminal(this.sessionKey);
+    this.sessionKey = session.key;
+    return session;
+  }
+
+  private switchSession(session: AlphaSessionState): void {
+    this.sessionKey = session.key;
+  }
+
+  private renderSessions(): void {
+    const terminalSessions = sessions.terminalSessions();
+    if (!terminalSessions.length) {
+      this.writeLine("No Alpha terminal sessions.");
+      return;
+    }
+    const activeKey = this.currentSession().key;
+    this.writeLine("Alpha terminal sessions:");
+    terminalSessions.forEach((session, index) => {
+      const marker = session.key === activeKey ? "*" : " ";
+      const turns = Math.ceil((session.terminalTranscript?.length ?? 0) / 2);
+      this.writeLine(`${marker} ${index + 1}. ${session.label} (${turns} turn${turns === 1 ? "" : "s"}, ${formatTerminalDate(session.updatedAt)})`);
+    });
+    this.writeLine("Use `/resume <number>` to switch sessions, or `/new <name>` to start another.");
+  }
+
+  private resolveSessionArgument(arg: string): AlphaSessionState | undefined {
+    const ordinal = Number(arg);
+    if (Number.isInteger(ordinal)) return sessions.getTerminalByOrdinal(ordinal);
+
+    const lower = arg.toLowerCase();
+    return sessions.terminalSessions().find((session) => session.label.toLowerCase().includes(lower));
+  }
+
+  private async pickSession(): Promise<AlphaSessionState | undefined> {
+    const terminalSessions = sessions.terminalSessions();
+    if (!terminalSessions.length) return undefined;
+    const picked = await vscode.window.showQuickPick(
+      terminalSessions.map((session, index) => ({
+        label: `${index + 1}. ${session.label}`,
+        description: formatTerminalDate(session.updatedAt),
+        detail: `${Math.ceil((session.terminalTranscript?.length ?? 0) / 2)} turn(s)`,
+        session,
+      })),
+      { title: "Resume Alpha Terminal Session", placeHolder: "Choose a session", ignoreFocusOut: true },
+    );
+    return picked?.session;
+  }
+
+  private prompt(): void {
+    this.write("alpha> ");
+  }
+
+  private writeMarkdown(text: string): void {
+    this.write(normalizeTerminalText(text));
+  }
+
+  private writeLine(text: string): void {
+    this.write(`${text}\r\n`);
+  }
+
+  private write(text: string): void {
+    this.writeEmitter.fire(text);
+  }
+}
+
+class TerminalResponseStream {
+  private readonly chunks: string[] = [];
+
+  constructor(private readonly write: (text: string) => void) {}
+
+  get markdownText(): string {
+    return this.chunks.join("").trim();
+  }
+
+  markdown(value: string | vscode.MarkdownString): void {
+    const text = typeof value === "string" ? value : value.value;
+    this.chunks.push(text);
+    this.write(text);
+  }
+
+  progress(value: string): void {
+    this.markdown(`_${value}_\n\n`);
+  }
+
+  asChatResponseStream(): vscode.ChatResponseStream {
+    return this as unknown as vscode.ChatResponseStream;
+  }
+}
+
+async function selectAlphaTerminalModel(): Promise<vscode.LanguageModelChat | undefined> {
+  let models: vscode.LanguageModelChat[];
+  try {
+    models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Alpha could not access Copilot models: ${message}`);
+    return undefined;
+  }
+
+  if (!models.length) {
+    void vscode.window.showErrorMessage("Alpha did not find any Copilot chat models. Check Copilot sign-in, policy, and Language Model API access.");
+    return undefined;
+  }
+
+  const preferred = models.find((model) => /gpt-4\.1|gpt-4o|claude.*sonnet/i.test(`${model.family} ${model.name}`));
+  return preferred ?? models[0];
+}
+
+async function handleAlphaTerminalRequest(
+  extensionContext: vscode.ExtensionContext,
+  session: AlphaSessionState,
+  input: string,
+  model: vscode.LanguageModelChat,
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const transcript = buildTerminalTranscript(session);
+  const request = terminalChatRequest(input, model);
+  const chatContext = terminalChatContext(transcript);
+  await handleAlphaParsedRequest(
+    extensionContext,
+    parseAlphaChatInput(input),
+    session,
+    request,
+    chatContext,
+    transcript,
+    stream,
+    token,
+  );
+}
+
+function terminalChatRequest(input: string, model: vscode.LanguageModelChat): vscode.ChatRequest {
+  const parsed = parseAlphaChatInput(input);
+  return {
+    prompt: parsed.prompt,
+    command: parsed.command,
+    model,
+    references: [],
+    toolReferences: [],
+  } as unknown as vscode.ChatRequest;
+}
+
+function terminalChatContext(transcript: readonly AlphaTranscriptEntry[]): vscode.ChatContext {
+  const historyLength = transcript.filter((entry) => entry.historyIndex !== undefined).length;
+  return {
+    history: new Array(historyLength),
+  } as unknown as vscode.ChatContext;
+}
+
+function buildTerminalTranscript(session: AlphaSessionState): AlphaTranscriptEntry[] {
+  const entries: AlphaTranscriptEntry[] = [];
+  const compactionSummary = session.compactionSummary?.trim();
+  if (compactionSummary) {
+    entries.push({
+      role: "compaction",
+      content: compactionSummary,
+      source: "compaction",
+    });
+  }
+  for (const entry of session.terminalTranscript ?? []) {
+    if (session.compactedThroughHistoryIndex !== undefined && (entry.historyIndex ?? -1) <= session.compactedThroughHistoryIndex) continue;
+    entries.push(entry);
+  }
+  return entries;
+}
+
+function rememberTerminalTurn(session: AlphaSessionState, prompt: string, response: string): void {
+  const transcript = session.terminalTranscript ?? [];
+  const nextHistoryIndex = transcript.reduce((max, entry) => Math.max(max, entry.historyIndex ?? -1), -1) + 1;
+  transcript.push({
+    role: "user",
+    content: prompt,
+    source: "chat-history",
+    historyIndex: nextHistoryIndex,
+    participant: "alpha.terminal",
+  });
+  if (response.trim()) {
+    transcript.push({
+      role: "assistant",
+      content: response.trim(),
+      source: "chat-history",
+      historyIndex: nextHistoryIndex + 1,
+    });
+  }
+  session.terminalTranscript = transcript.slice(-200);
+  sessions.persistNow();
+}
+
+function normalizeTerminalText(text: string): string {
+  return text.replace(/\r?\n/g, "\r\n");
+}
+
+function formatTerminalDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
 async function handleAlphaRequest(
@@ -151,6 +604,19 @@ async function handleAlphaRequest(
     compactionSummary: session.compactionSummary,
     compactedThroughHistoryIndex: session.compactedThroughHistoryIndex,
   });
+  await handleAlphaParsedRequest(extensionContext, parsedRequest, session, request, chatContext, transcript, stream, token);
+}
+
+async function handleAlphaParsedRequest(
+  extensionContext: vscode.ExtensionContext,
+  parsedRequest: ParsedAlphaChatRequest,
+  session: AlphaSessionState,
+  request: vscode.ChatRequest,
+  chatContext: vscode.ChatContext,
+  transcript: AlphaTranscriptEntry[],
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
   const alphaContext: AlphaContext = {
     extensionContext,
     sessionKey: session.key,
@@ -761,8 +1227,16 @@ interface ParsedAlphaChatRequest {
 }
 
 function parseAlphaChatRequest(request: vscode.ChatRequest): ParsedAlphaChatRequest {
-  const prompt = request.prompt.trim();
-  const command = request.command?.trim();
+  return parseAlphaPrompt(request.prompt, request.command);
+}
+
+function parseAlphaChatInput(input: string): ParsedAlphaChatRequest {
+  return parseAlphaPrompt(input);
+}
+
+function parseAlphaPrompt(input: string, explicitCommand?: string): ParsedAlphaChatRequest {
+  const prompt = input.trim();
+  const command = explicitCommand?.trim();
   if (command) return { command, prompt };
 
   const match = /^\/([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(prompt);
