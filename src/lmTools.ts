@@ -14,6 +14,7 @@ import {
   wrapCompactionForModel,
   wrapInternalForModel,
 } from "./transcript";
+import { renderGoalContinuationHint } from "./goalMode";
 import type { AlphaTranscriptEntry } from "./transcript";
 import { getAdvertisedAlphaLanguageModelTools, runRegisteredAlphaTool } from "./toolRegistry";
 import type { AlphaToolSelection } from "./toolRegistry";
@@ -77,6 +78,7 @@ export async function answerWithAlphaTools(prompt: string, ctx: AlphaContext): P
 
     if (!toolCalls.length) {
       ctx.stream.markdown(bufferedText.join(""));
+      streamGoalContinuationHint(ctx);
       return;
     }
 
@@ -297,10 +299,17 @@ async function streamFinalNoToolResponse(
     if (!emitted) {
       ctx.stream.markdown(`${reason} No final model text was returned.`);
     }
+    streamGoalContinuationHint(ctx);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.stream.markdown(`${reason} Final no-tool response failed: ${message}`);
   }
+}
+
+function streamGoalContinuationHint(ctx: AlphaContext): void {
+  if (!vscode.workspace.getConfiguration("alpha").get<boolean>("goal.continuationHint", true)) return;
+  const hint = renderGoalContinuationHint(ctx.goalMode);
+  if (hint) ctx.stream.markdown(hint);
 }
 
 function mainAgentRequestBudget(): number {
@@ -437,16 +446,20 @@ function transcriptEntryToLanguageModelMessage(entry: AlphaTranscriptEntry): vsc
 
 function getBaseToolSelection(ctx: AlphaContext): AlphaToolSelection {
   const discoveryMode = vscode.workspace.getConfiguration("alpha").get<"off" | "all">("tools.discoveryMode", "off");
+  const forcedModeTools = [
+    ...(ctx.planMode?.active ? ["resolve"] : []),
+    ...(ctx.goalMode ? ["goal"] : []),
+  ];
   if (discoveryMode === "all") {
     return {
       ctx,
       includeDiscoverable: false,
-      forceTools: [...(ctx.planMode?.active ? ["resolve"] : []), "search_tool_bm25", ...ctx.discoveredTools.list()],
+      forceTools: [...forcedModeTools, "search_tool_bm25", ...ctx.discoveredTools.list()],
     };
   }
   return {
     ctx,
     includeDiscoverable: true,
-    forceTools: ctx.planMode?.active ? ["resolve"] : undefined,
+    forceTools: forcedModeTools.length ? forcedModeTools : undefined,
   };
 }

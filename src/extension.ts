@@ -7,8 +7,21 @@ import type { AlphaContext } from "./types";
 import { alphaContextUsageForPrompt, answerWithAlphaTools } from "./lmTools";
 import { runAlphaCommit } from "./commitWorkflow";
 import { compactTranscriptWithModel, compactableTranscriptEntries, formatContextUsage } from "./contextManager";
+import {
+  completeGoal,
+  createGoal,
+  dropGoal,
+  goalToolResponse,
+  parseGoalCommand,
+  pauseGoal,
+  renderGoalStatus,
+  renderGoalToolResponse,
+  replaceGoal,
+  resumeGoal,
+  updateGoalBudget,
+} from "./goalMode";
 import { resolveInternalUrl } from "./internalUrls";
-import { createPlanModeState, renderPlanModeStatus, renderPlanReview } from "./planMode";
+import { buildPlanGoalObjective, createPlanModeState, isPlanApprovalAsGoalPrompt, renderPlanModeStatus, renderPlanReview } from "./planMode";
 import { buildInteractiveReviewPrompt } from "./reviewCore";
 import { workspaceRoot } from "./workspace";
 
@@ -138,12 +151,18 @@ async function handleAlphaRequest(
     permissionDecisions: session.permissionDecisions,
     discoveredTools: session.discoveredTools,
     planMode: session.planMode,
+    goalMode: session.goalMode,
     persistSession: () => sessions.persistNow(),
     setCompaction: (summary, compactedThroughHistoryIndex) => {
       session.compactionSummary = summary;
       session.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
       alphaContext.compactionSummary = summary;
       alphaContext.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
+      sessions.persistNow();
+    },
+    setGoalMode: (state) => {
+      session.goalMode = state;
+      alphaContext.goalMode = state;
       sessions.persistNow();
     },
   };
@@ -172,12 +191,21 @@ async function handleAlphaRequest(
       return;
     }
 
+    if (parsedRequest.command === "goal") {
+      await handleGoalCommand(parsedRequest.prompt, session, alphaContext);
+      return;
+    }
+
     if (parsedRequest.command === "compact") {
       await compactAlphaSession(parsedRequest.prompt, session, alphaContext);
       return;
     }
 
     if (parsedRequest.command === "plan") {
+      if (session.goalMode?.enabled) {
+        stream.markdown("Exit or complete the active Alpha goal before entering plan mode.");
+        return;
+      }
       await handlePlanCommand(parsedRequest.prompt, session, alphaContext);
       return;
     }
@@ -198,6 +226,71 @@ async function handleAlphaRequest(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stream.markdown(`Alpha error: ${message}`);
+  }
+}
+
+async function handleGoalCommand(
+  prompt: string,
+  session: AlphaSessionState,
+  ctx: AlphaContext,
+): Promise<void> {
+  if (session.planMode?.active) {
+    ctx.stream.markdown("Exit Alpha plan mode before starting or changing a goal.");
+    return;
+  }
+
+  const parsed = parseGoalCommand(prompt);
+  if (parsed.op === "get") {
+    ctx.stream.markdown(renderGoalStatus(session.goalMode));
+    return;
+  }
+
+  if (parsed.op === "create") {
+    const next = createGoal(session.goalMode, parsed.objective ?? "", parsed.tokenBudget);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(renderGoalToolResponse(goalToolResponse("create", next.goal)));
+    return;
+  }
+
+  if (parsed.op === "replace") {
+    const next = replaceGoal(session.goalMode, parsed.objective ?? "", parsed.tokenBudget);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(renderGoalToolResponse(goalToolResponse("create", next.goal)));
+    return;
+  }
+
+  if (parsed.op === "resume") {
+    const next = resumeGoal(session.goalMode);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(renderGoalToolResponse(goalToolResponse("resume", next.goal)));
+    return;
+  }
+
+  if (parsed.op === "pause") {
+    const next = pauseGoal(session.goalMode);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(next ? renderGoalToolResponse(goalToolResponse("get", next.goal)) : "No active goal.");
+    return;
+  }
+
+  if (parsed.op === "budget") {
+    const next = updateGoalBudget(session.goalMode, parsed.tokenBudget);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(renderGoalToolResponse(goalToolResponse("get", next.goal)));
+    return;
+  }
+
+  if (parsed.op === "complete") {
+    const next = completeGoal(session.goalMode);
+    ctx.setGoalMode?.(next);
+    ctx.stream.markdown(renderGoalToolResponse(goalToolResponse("complete", next.goal, true)));
+    return;
+  }
+
+  if (parsed.op === "drop") {
+    const dropped = dropGoal(session.goalMode);
+    ctx.setGoalMode?.(undefined);
+    ctx.stream.markdown(dropped ? renderGoalToolResponse(goalToolResponse("drop", dropped)) : "No active goal.");
   }
 }
 
@@ -267,7 +360,7 @@ async function handlePlanReviewCommand(
       "",
       `Current context: ${formatContextUsage(contextUsage)}`,
       "",
-      "This plan is not waiting for approval. Type `approve and implement` to retry it, `refine: <what to change>` to revise it, or `discard plan` to clear it.",
+      "This plan is not waiting for approval. Type `approve and implement as goal` to retry it with goal tracking, `approve and implement` to retry once, `refine: <what to change>` to revise it, or `discard plan` to clear it.",
     ].join("\n"));
     return;
   }
@@ -279,7 +372,7 @@ async function handlePlanReviewCommand(
   state.updatedAt = new Date().toISOString();
   ctx.planMode = state;
   sessions.persistNow();
-  ctx.stream.markdown(`${renderPlanReview(state)}\n\nCurrent context: ${formatContextUsage(contextUsage)}\n\nType one of:\n- \`approve and implement\`\n- \`refine: <what to change>\`\n- \`discard plan\``);
+  ctx.stream.markdown(`${renderPlanReview(state)}\n\nCurrent context: ${formatContextUsage(contextUsage)}\n\nType one of:\n- \`approve and implement as goal\`\n- \`approve and implement\`\n- \`refine: <what to change>\`\n- \`discard plan\``);
 }
 
 async function handlePlanDecisionPrompt(
@@ -339,17 +432,33 @@ async function approvePlanAndExecute(
     return;
   }
 
-  const approvedPlan = state.approvedPlan ?? (await resolveInternalUrl(state.approvedPlanPath ?? state.planPath, ctx)).content;
+  const approvedPlanPath = state.approvedPlanPath ?? state.planPath;
+  const approvedPlan = state.approvedPlan ?? (await resolveInternalUrl(approvedPlanPath, ctx)).content;
+  const executeAsGoal = isPlanApprovalAsGoalPrompt(userApprovalMessage);
   state.approvedPlan = approvedPlan;
-  state.approvedPlanPath = state.approvedPlanPath ?? state.planPath;
+  state.approvedPlanPath = approvedPlanPath;
   state.active = false;
   state.pendingApproval = false;
   state.updatedAt = new Date().toISOString();
   ctx.planMode = state;
+  if (executeAsGoal) {
+    if (session.goalMode?.goal && session.goalMode.goal.status !== "complete" && session.goalMode.goal.status !== "dropped") {
+      ctx.stream.markdown("An Alpha goal is already active. Complete, pause, or drop it before approving this plan as a new goal.");
+      sessions.persistNow();
+      return;
+    }
+    const goalState = createGoal(
+      session.goalMode,
+      buildPlanGoalObjective(approvedPlan, approvedPlanPath, userApprovalMessage),
+    );
+    ctx.setGoalMode?.(goalState);
+  }
   sessions.persistNow();
 
   const executionPrompt = [
-    "The user explicitly approved the pending Alpha plan. Implement it now.",
+    executeAsGoal
+      ? "The user explicitly approved the pending Alpha plan as an active Alpha goal. Implement the approved plan now while preserving the goal until verified complete."
+      : "The user explicitly approved the pending Alpha plan. Implement it now.",
     `\nApproved plan:\n${approvedPlan}`,
     userApprovalMessage ? `\nUser approval message:\n${userApprovalMessage}` : "",
   ].join("\n");

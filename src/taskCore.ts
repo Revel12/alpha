@@ -19,9 +19,12 @@ export interface AgentDefinition {
   filePath?: string;
 }
 
+export type SpawnAllowance = string[] | "*" | "";
+
 export interface TaskItem {
   id?: string;
   description?: string;
+  role?: string;
   assignment?: string;
   isolated?: boolean;
 }
@@ -30,6 +33,7 @@ export interface TaskParams {
   agent?: string;
   id?: string;
   description?: string;
+  role?: string;
   assignment?: string;
   tasks?: TaskItem[];
   context?: string;
@@ -45,6 +49,8 @@ export interface AgentProgress {
   task: string;
   assignment?: string;
   description?: string;
+  role?: string;
+  displayName?: string;
   recentOutput: string[];
   toolCount: number;
   requests: number;
@@ -59,6 +65,8 @@ export interface SingleResult {
   task: string;
   assignment?: string;
   description?: string;
+  role?: string;
+  displayName?: string;
   exitCode: number;
   output: string;
   stderr: string;
@@ -92,6 +100,45 @@ const DEFAULT_BATCH_ENABLED = true;
 const DEFAULT_MAX_CONCURRENCY = 4;
 const DEFAULT_MAX_OUTPUT_BYTES = 500_000;
 const DEFAULT_MAX_OUTPUT_LINES = 5000;
+export const DEFAULT_MAX_RECURSION_DEPTH = 2;
+
+export const PLAN_MODE_SUBAGENT_PROMPT = [
+  "<critical>",
+  "Plan mode active. You MUST perform READ-ONLY operations only.",
+  "",
+  "You NEVER:",
+  "- Create, edit, delete, move, or copy files",
+  "- Run state-changing commands (git, build system, package manager, migrations)",
+  "- Make any changes to the system",
+  "</critical>",
+  "",
+  "<role>",
+  "Software architect and planning specialist for the main agent.",
+  "You MUST explore the codebase and report findings. The main agent updates the plan file.",
+  "</role>",
+  "",
+  "<procedure>",
+  "1. You MUST use read-only tools to investigate",
+  "2. You MUST describe plan changes in your response text",
+  "3. You MUST end with a Critical Files section",
+  "</procedure>",
+  "",
+  "<output>",
+  "End response with:",
+  "",
+  "### Critical Files for Implementation",
+  "",
+  "List 3-5 files most critical for implementing this plan:",
+  "- `path/to/file1.ts` - Brief reason",
+  "- `path/to/file2.ts` - Brief reason",
+  "</output>",
+  "",
+  "<critical>",
+  "You MUST keep going until complete.",
+  "</critical>",
+].join("\n");
+
+const PLAN_MODE_AGENT_TOOL_ALLOWLIST = new Set(["read", "search", "find", "lsp", "web_search", "report_finding"]);
 
 const BUILTIN_AGENT_PROMPT = [
   "You are an Alpha subagent.",
@@ -195,6 +242,7 @@ const BUILTIN_AGENTS: readonly AgentDefinition[] = [
         },
       },
     },
+    spawns: ["explore"],
     blocking: true,
     source: "bundled",
   },
@@ -206,6 +254,7 @@ const BUILTIN_AGENTS: readonly AgentDefinition[] = [
       "Produce a concrete implementation plan. Do not edit files.",
     ].join("\n\n"),
     tools: ["read", "search", "find", "lsp", "todo"],
+    spawns: ["explore"],
     source: "bundled",
   },
   {
@@ -233,8 +282,10 @@ export function repairTaskParams(params: TaskParams): TaskParams {
     repaired.tasks = repaired.tasks.map((task) => ({
       ...task,
       assignment: typeof task.assignment === "string" ? maybeDecodeJsonString(task.assignment) : task.assignment,
+      role: typeof task.role === "string" ? maybeDecodeJsonString(task.role) : task.role,
     }));
   }
+  if (typeof repaired.role === "string") repaired.role = maybeDecodeJsonString(repaired.role);
   return repaired;
 }
 
@@ -296,13 +347,14 @@ export function validateSpawnParams(params: TaskParams, batchEnabled: boolean): 
 
 export function resolveSpawnItems(params: TaskParams): TaskItem[] {
   if (Array.isArray(params.tasks) && params.tasks.length > 0) return params.tasks;
-  return [{ id: params.id, description: params.description, assignment: params.assignment, isolated: params.isolated }];
+  return [{ id: params.id, description: params.description, role: params.role, assignment: params.assignment, isolated: params.isolated }];
 }
 
 export function spawnParamsFor(params: TaskParams, item: TaskItem): TaskParams {
   const spawn: TaskParams = { agent: params.agent };
   if (item.id !== undefined) spawn.id = item.id;
   if (item.description !== undefined) spawn.description = item.description;
+  if (item.role !== undefined) spawn.role = item.role;
   if (item.assignment !== undefined) spawn.assignment = item.assignment;
   if (params.context !== undefined) spawn.context = params.context;
   if (item.isolated !== undefined) {
@@ -311,6 +363,100 @@ export function spawnParamsFor(params: TaskParams, item: TaskItem): TaskParams {
     spawn.isolated = params.isolated;
   }
   return spawn;
+}
+
+export function canSpawnAtDepth(maxRecursionDepth: number, taskDepth: number): boolean {
+  return maxRecursionDepth < 0 || taskDepth < maxRecursionDepth;
+}
+
+export function normalizeSpawnAllowance(spawns: AgentDefinition["spawns"]): SpawnAllowance {
+  if (spawns === "*") return "*";
+  if (Array.isArray(spawns)) return spawns;
+  return "";
+}
+
+export function isAgentSpawnAllowed(agentName: string, allowance: SpawnAllowance | undefined): boolean {
+  const normalized = allowance ?? "*";
+  if (normalized === "*") return true;
+  if (normalized === "") return false;
+  return normalized.includes(agentName);
+}
+
+export function validateSpawnPermission(input: {
+  agentName: string;
+  allowedSpawns?: SpawnAllowance;
+  blockedAgent?: string;
+  taskDepth?: number;
+  maxRecursionDepth: number;
+}): string | undefined {
+  const agentName = input.agentName.trim();
+  if (!agentName) return "Missing `agent`. Provide an agent type to spawn.";
+  if (!canSpawnAtDepth(input.maxRecursionDepth, input.taskDepth ?? 0)) {
+    return `Cannot spawn '${agentName}'. Maximum task recursion depth (${input.maxRecursionDepth}) reached.`;
+  }
+  if (input.blockedAgent && agentName === input.blockedAgent) {
+    return `Cannot spawn ${input.blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`;
+  }
+  if (!isAgentSpawnAllowed(agentName, input.allowedSpawns)) {
+    const allowed = input.allowedSpawns === "" ? "none (spawns disabled for this agent)" : (input.allowedSpawns ?? "*");
+    return `Cannot spawn '${agentName}'. Allowed: ${Array.isArray(allowed) ? allowed.join(", ") : allowed}`;
+  }
+  return undefined;
+}
+
+export function agentForPlanMode(agent: AgentDefinition): AgentDefinition {
+  const tools = [
+    "read",
+    "search",
+    "find",
+    "lsp",
+    "web_search",
+    ...(agent.tools ?? []).filter((tool) => PLAN_MODE_AGENT_TOOL_ALLOWLIST.has(tool) && !["read", "search", "find", "lsp", "web_search"].includes(tool)),
+  ];
+  return {
+    ...agent,
+    systemPrompt: `${PLAN_MODE_SUBAGENT_PROMPT}\n\n${agent.systemPrompt}`,
+    tools,
+    spawns: undefined,
+  };
+}
+
+export function agentToolNames(input: {
+  agent: AgentDefinition;
+  taskDepth: number;
+  maxRecursionDepth: number;
+  planModeActive?: boolean;
+}): string[] {
+  const base = input.agent.tools?.length
+    ? [...input.agent.tools]
+    : ["read", "bash", "search", "find", "edit", "write", "lsp", "job", "todo"];
+  const names = base.filter((name) => name !== "task");
+  if (
+    !input.planModeActive &&
+    input.agent.spawns !== undefined &&
+    canSpawnAtDepth(input.maxRecursionDepth, input.taskDepth)
+  ) {
+    names.push("task");
+  }
+  return [...new Set(names)];
+}
+
+export function allocateNestedTaskId(requested: string | undefined, existingIds: ReadonlySet<string>, parentPrefix?: string): string {
+  const localExisting = new Set<string>();
+  const prefix = parentPrefix?.trim();
+  if (prefix) {
+    for (const id of existingIds) {
+      if (id.startsWith(`${prefix}.`)) localExisting.add(id.slice(prefix.length + 1));
+    }
+  }
+  const local = allocateTaskId(requested, localExisting);
+  const scoped = prefix ? `${prefix}.${local}` : local;
+  if (!existingIds.has(scoped)) return scoped;
+  for (let index = 2; index < 1000; index++) {
+    const candidate = `${scoped}${index}`;
+    if (!existingIds.has(candidate)) return candidate;
+  }
+  return `${scoped}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export { DEFAULT_BATCH_ENABLED, DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES };
@@ -371,6 +517,7 @@ export function renderTaskDescription(agents: AgentDefinition[], options: { asyn
   return [
     mode,
     `Concurrency is bounded at ${options.maxConcurrency} running subagents per session.`,
+    "Subagents may recursively spawn child agents only when their agent definition has `spawns`, the parent allowlist permits the child, and alpha.task.maxRecursionDepth has not been reached. Plan-mode subagents are always read-only and cannot spawn children.",
     "Subagents have no conversation history; every fact, file path, and acceptance criterion must be explicit in context or assignment.",
     "Subagents must skip project-wide gates, formatters, and tests unless explicitly assigned.",
     "Alpha host limitations: isolated git worktrees, IRC keep-alive, mcp://, vault://, and raw OMP TUI lifecycle events are not available in the VS Code chat participant.",
@@ -383,17 +530,56 @@ export function renderTaskDescription(agents: AgentDefinition[], options: { asyn
 export function renderSubagentPrompt(agent: AgentDefinition, params: TaskParams): string {
   const assignment = (params.assignment ?? "").trim();
   const context = (params.context ?? "").trim();
+  const role = (params.role ?? "").trim();
+  const outputContract = agent.output === undefined
+    ? undefined
+    : [
+        "# Structured Output Contract",
+        "Return the final result as JSON that satisfies this JTD-style schema. Do not wrap the JSON in markdown fences.",
+        JSON.stringify(agent.output, null, 2),
+        "",
+      ].join("\n");
   return [
     "# Agent",
     agent.systemPrompt.trim(),
     "",
+    role ? `# Specialist Role\n${role}\n` : undefined,
     context ? `# Shared Context\n${context}\n` : undefined,
     "# Assignment",
     assignment,
     "",
     "# Output",
-    "Return only the final result for the parent. Include changed files, findings, blockers, and verification performed.",
+    agent.output === undefined
+      ? "Return only the final result for the parent. Include changed files, findings, blockers, and verification performed."
+      : "Return only JSON for the parent. Include no prose outside the JSON object.",
+    outputContract,
   ].filter((part): part is string => typeof part === "string").join("\n");
+}
+
+export function resolveSubagentDisplayName(role: string | undefined, agentName: string): string {
+  const normalized = oneLineLabel(role ?? "");
+  return normalized || agentName;
+}
+
+export function oneLineLabel(text: string, max = 80): string {
+  const oneLine = text.replace(/[\p{Cc}\p{Cf}\s]+/gu, " ").trim();
+  const cap = Math.max(1, max);
+  const chars = [...oneLine];
+  return chars.length > cap ? `${chars.slice(0, cap - 1).join("")}...` : oneLine;
+}
+
+export interface OutputValidationResult {
+  ok: boolean;
+  value?: unknown;
+  errors: string[];
+}
+
+export function validateAgentOutput(output: string, schema: unknown): OutputValidationResult {
+  if (schema === undefined) return { ok: true, errors: [] };
+  const parsed = parseJsonOutput(output);
+  if (!parsed.ok) return { ok: false, errors: [parsed.error] };
+  const errors = validateJtdValue(parsed.value, schema, "$");
+  return { ok: errors.length === 0, value: parsed.value, errors };
 }
 
 export function allocateTaskId(requested: string | undefined, existingIds: ReadonlySet<string>): string {
@@ -425,13 +611,19 @@ export function truncateTaskOutput(output: string, maxBytes = DEFAULT_MAX_OUTPUT
 
 export function renderTaskSummary(result: SingleResult): string {
   const status = result.aborted ? "cancelled" : result.exitCode === 0 ? "completed" : `failed (exit ${result.exitCode})`;
-  const output = result.output.trim() || result.stderr.trim() || (result.requests > 0 ? `(no output) after ${result.requests} req` : "(no output)");
+  const stderr = result.stderr.trim();
+  const output = result.output.trim();
+  const body = result.exitCode === 0
+    ? output || stderr || (result.requests > 0 ? `(no output) after ${result.requests} req` : "(no output)")
+    : [stderr, output && !stderr.includes(output) ? `Partial output:\n${output}` : undefined].filter((line): line is string => typeof line === "string").join("\n\n")
+      || (result.requests > 0 ? `(no output) after ${result.requests} req` : "(no output)");
   return [
-    `Task ${result.id} (${result.agent}) ${status} in ${formatDuration(result.durationMs)}.`,
+    `Task ${result.id} (${result.displayName ?? result.agent}) ${status} in ${formatDuration(result.durationMs)}.`,
     result.description ? `Description: ${result.description}` : undefined,
+    result.role ? `Role: ${result.role}` : undefined,
     result.truncated ? "Output was truncated; full output is stored as an artifact." : undefined,
     "",
-    output,
+    body,
     result.outputPath ? `\nOutput: ${result.outputPath}` : undefined,
   ].filter((line): line is string => typeof line === "string").join("\n");
 }
@@ -527,8 +719,8 @@ function parseSimpleYaml(raw: string): Record<string, unknown> {
     if (!key) continue;
     if (value === "true") out[key] = true;
     else if (value === "false") out[key] = false;
-    else if (value.startsWith("[") && value.endsWith("]")) {
-      out[key] = value.slice(1, -1).split(",").map((item) => stripQuotes(item.trim())).filter(Boolean);
+    else if ((value.startsWith("{") && value.endsWith("}")) || (value.startsWith("[") && value.endsWith("]"))) {
+      out[key] = parseInlineYamlValue(value);
     } else {
       out[key] = stripQuotes(value);
     }
@@ -565,6 +757,17 @@ function booleanField(input: Record<string, unknown>, key: string): boolean | un
   return typeof value === "boolean" ? value : undefined;
 }
 
+function parseInlineYamlValue(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    if (value.startsWith("[") && value.endsWith("]")) {
+      return value.slice(1, -1).split(",").map((item) => stripQuotes(item.trim())).filter(Boolean);
+    }
+    return stripQuotes(value);
+  }
+}
+
 async function pathExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -582,4 +785,98 @@ function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
+}
+
+function parseJsonOutput(output: string): { ok: true; value: unknown } | { ok: false; error: string } {
+  const trimmed = output.trim();
+  if (!trimmed) return { ok: false, error: "Output schema validation failed: subagent returned no JSON." };
+  try {
+    return { ok: true, value: JSON.parse(trimmed) };
+  } catch {
+    const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+    if (fenced) {
+      try {
+        return { ok: true, value: JSON.parse(fenced[1]) };
+      } catch {
+        // Fall through to the plain error below.
+      }
+    }
+    return { ok: false, error: "Output schema validation failed: subagent output is not valid JSON." };
+  }
+}
+
+function validateJtdValue(value: unknown, schema: unknown, pathLabel: string): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const spec = schema as Record<string, unknown>;
+  const errors: string[] = [];
+
+  if (Array.isArray(spec.enum)) {
+    if (!spec.enum.includes(value)) {
+      errors.push(`${pathLabel} must be one of ${spec.enum.map((item) => JSON.stringify(item)).join(", ")}`);
+    }
+    return errors;
+  }
+
+  if (typeof spec.type === "string") {
+    if (!jtdTypeMatches(value, spec.type)) errors.push(`${pathLabel} must be ${spec.type}`);
+    return errors;
+  }
+
+  if (spec.elements !== undefined) {
+    if (!Array.isArray(value)) {
+      errors.push(`${pathLabel} must be an array`);
+    } else {
+      for (let index = 0; index < value.length; index++) {
+        errors.push(...validateJtdValue(value[index], spec.elements, `${pathLabel}[${index}]`));
+      }
+    }
+    return errors;
+  }
+
+  if (spec.values !== undefined) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      errors.push(`${pathLabel} must be an object`);
+    } else {
+      for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+        errors.push(...validateJtdValue(nested, spec.values, `${pathLabel}.${key}`));
+      }
+    }
+    return errors;
+  }
+
+  const required = objectProperties(spec.properties);
+  const optional = objectProperties(spec.optionalProperties);
+  if (required || optional) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      errors.push(`${pathLabel} must be an object`);
+      return errors;
+    }
+    const record = value as Record<string, unknown>;
+    for (const [key, nested] of Object.entries(required ?? {})) {
+      if (!(key in record)) {
+        errors.push(`${pathLabel}.${key} is required`);
+      } else {
+        errors.push(...validateJtdValue(record[key], nested, `${pathLabel}.${key}`));
+      }
+    }
+    for (const [key, nested] of Object.entries(optional ?? {})) {
+      if (key in record) errors.push(...validateJtdValue(record[key], nested, `${pathLabel}.${key}`));
+    }
+    return errors;
+  }
+
+  return errors;
+}
+
+function objectProperties(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function jtdTypeMatches(value: unknown, type: string): boolean {
+  if (type === "string") return typeof value === "string";
+  if (type === "boolean") return typeof value === "boolean";
+  if (type === "float32" || type === "float64" || type === "number") return typeof value === "number" && Number.isFinite(value);
+  if (type === "timestamp") return typeof value === "string" && !Number.isNaN(Date.parse(value));
+  if (["int8", "uint8", "int16", "uint16", "int32", "uint32"].includes(type)) return typeof value === "number" && Number.isInteger(value);
+  return true;
 }

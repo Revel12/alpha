@@ -1,5 +1,6 @@
 import { getAdvertisedAlphaTools } from "./toolRegistry";
 import type { AlphaToolSelection } from "./toolRegistry";
+import { goalModeSystemPrompt } from "./goalMode";
 import { planModeSystemPrompt } from "./planMode";
 import type { AlphaContext } from "./types";
 
@@ -17,6 +18,7 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
       ].filter((line): line is string => typeof line === "string")
     : [];
   const planLines = ctx ? planModeSystemPrompt(ctx) : undefined;
+  const goalLines = ctx ? goalModeSystemPrompt(ctx.goalMode) : undefined;
   const approvedPlanLines = ctx?.planMode?.approvedPlan && !ctx.planMode.active
     ? [
         "# Approved Plan",
@@ -33,6 +35,7 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "Use tools whenever they materially improve correctness, completeness, or grounding.",
     "",
     ...sessionLines,
+    ...(goalLines ? [goalLines, ""] : []),
     ...(planLines ? [planLines, ""] : []),
     ...(approvedPlanLines ? [approvedPlanLines, ""] : []),
     "TOOLS",
@@ -41,6 +44,7 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     inventory,
     "",
     "# Tool Priority",
+    "- persistent objective tracking -> hidden `goal` when goal mode is active.",
     "- file/dir reads -> `read`; reading a directory path lists its entries.",
     "- URLs, `artifact://`, `history://`, `local://`, `memory://`, `omp://`, `pr://`, archive members, SQLite tables/queries, notebooks, documents, images, and large-file structural summaries -> `read`.",
     "- IaC files such as YAML, Terraform/HCL, Dockerfile, and Helm templates use the same `read`, `search`, `lsp`, `bash`, `edit`, and `write` workflow as OMP.",
@@ -165,6 +169,8 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "- Use `task` to fan out independent work to Alpha subagents when tasks can run without seeing each other's results.",
     "- Public `task` shape follows OMP batch mode: `agent`, shared `context`, and `tasks: [{ id?, description?, assignment }]`.",
     "- Maximize fan-out: put related parallel work in one `tasks[]` batch instead of serial task calls.",
+    "- OMP-style recursive task is available only inside subagents whose agent definition declares `spawns`; child spawning is bounded by alpha.task.maxRecursionDepth and self-recursion is blocked.",
+    "- Plan-mode subagents are always read-only and cannot recursively spawn children; the main planner may still use first-level `explore` fan-out.",
     "- Subagents have no conversation history. Put every required fact, file path, decision, non-goal, and acceptance criterion in `context` or `assignment`.",
     "- Assignments must be self-contained and specific. No globs, no package-wide scopes, no vague 'update all' requests.",
     "- Subagents do not own final verification. Tell them to skip project-wide formatters, lint, and tests unless explicitly assigned; run final gates once yourself.",

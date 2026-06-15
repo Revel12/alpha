@@ -14,6 +14,21 @@ import {
 } from "../out/toolRegistry.js";
 import { buildAlphaSystemPrompt } from "../out/promptBuilder.js";
 import {
+  completeGoal,
+  createGoal,
+  createGoalState,
+  dropGoal,
+  goalModeSystemPrompt,
+  goalToolResponse,
+  isGoalContinuationActive,
+  parseGoalCommand,
+  remainingTokens,
+  renderGoalContinuationHint,
+  renderGoalToolResponse,
+  resumeGoal,
+  updateGoalBudget,
+} from "../out/goalMode.js";
+import {
   askApproval,
   bashApproval,
   bitbucketApproval,
@@ -60,15 +75,28 @@ import {
   spliceConflict,
 } from "../out/conflictCore.js";
 import { jobTool } from "../out/tools/job.js";
+import { goalTool } from "../out/tools/goal.js";
 import {
   parseEvalInput,
   runEvalCells,
   validateEvalParams,
 } from "../out/evalCore.js";
 import {
+  agentForPlanMode,
+  agentToolNames,
+  allocateNestedTaskId,
+  canSpawnAtDepth,
   discoverAgents,
+  isAgentSpawnAllowed,
+  normalizeSpawnAllowance,
   parseAgent,
+  renderSubagentPrompt,
   renderTaskDescription,
+  renderTaskSummary,
+  resolveSpawnItems,
+  spawnParamsFor,
+  validateAgentOutput,
+  validateSpawnPermission,
   validateShapeParams,
   validateSpawnParams,
 } from "../out/taskCore.js";
@@ -145,8 +173,11 @@ import {
   duplicateTopLevelPythonDefinitions,
 } from "../out/pythonStaticChecks.js";
 import {
+  buildPlanGoalObjective,
   assertPlanModeWriteAllowed,
   createPlanModeState,
+  isPlanApprovalAsGoalPrompt,
+  planModeSystemPrompt,
   renderPlanReview,
 } from "../out/planMode.js";
 import {
@@ -235,12 +266,14 @@ test("hidden tools are registered but not advertised by default", () => {
   assert.equal(getAlphaToolRegistration("search_tool_bm25")?.visibility, "hidden");
   assert.equal(getAlphaToolRegistration("report_finding")?.visibility, "hidden");
   assert.equal(getAlphaToolRegistration("yield")?.visibility, "hidden");
+  assert.equal(getAlphaToolRegistration("goal")?.visibility, "hidden");
 
   const advertisedNames = new Set(getAdvertisedAlphaTools().map((tool) => tool.name));
   assert.equal(advertisedNames.has("resolve"), false);
   assert.equal(advertisedNames.has("search_tool_bm25"), false);
   assert.equal(advertisedNames.has("report_finding"), false);
   assert.equal(advertisedNames.has("yield"), false);
+  assert.equal(advertisedNames.has("goal"), false);
 });
 
 test("hidden tools can be forced for a workflow", () => {
@@ -274,6 +307,20 @@ test("review workflow exposes hidden report_finding and yield schemas", () => {
   assert.deepEqual(report.inputSchema.properties.priority.enum, ["P0", "P1", "P2", "P3"]);
   assert.equal(yieldTool.visibility, "hidden");
   assert.equal(yieldTool.inputSchema.properties.data.type, "object");
+});
+
+test("goal exposes OMP-style mode-gated schema", () => {
+  const goal = getAlphaToolRegistration("goal");
+
+  assert.equal(goal.visibility, "hidden");
+  assert.deepEqual(goal.inputSchema.required, ["op"]);
+  assert.deepEqual(goal.inputSchema.properties.op.enum, ["create", "get", "complete", "resume", "drop"]);
+  assert.equal(goal.inputSchema.properties.objective.type, "string");
+  assert.equal(goal.inputSchema.properties.token_budget.type, "number");
+
+  const activeCtx = makeToolContext({ goalMode: createGoalState("Ship the thing") });
+  const names = getAdvertisedAlphaLanguageModelTools({ ctx: activeCtx, forceTools: ["goal"] }).map((tool) => tool.name);
+  assert.equal(names.includes("goal"), true);
 });
 
 test("essential-only selection follows OMP-style load modes", () => {
@@ -1029,6 +1076,7 @@ test("task exposes OMP-style batch subagent contract", () => {
   assert.deepEqual(task.inputSchema.properties.tasks.items.required, ["assignment"]);
   assert.equal(task.inputSchema.properties.tasks.items.properties.id.type, "string");
   assert.equal(task.inputSchema.properties.tasks.items.properties.description.type, "string");
+  assert.equal(task.inputSchema.properties.tasks.items.properties.role.type, "string");
   assert.equal(task.inputSchema.properties.tasks.items.properties.assignment.type, "string");
   assert.equal(task.inputSchema.properties.tasks.items.properties.isolated.type, "boolean");
 });
@@ -1045,8 +1093,29 @@ test("task validation matches OMP batch shape rules", () => {
   assert.equal(validateSpawnParams({
     agent: "task",
     context: "ctx",
-    tasks: [{ id: "A", assignment: "One" }],
+    tasks: [{ id: "A", role: "API specialist", assignment: "One" }],
   }, true), undefined);
+});
+
+test("task role propagates into spawn params and subagent prompt", () => {
+  const params = {
+    agent: "task",
+    context: "Shared facts",
+    tasks: [{ id: "A", role: "Rust async-runtime specialist", assignment: "Inspect scheduler." }],
+  };
+  const item = resolveSpawnItems(params)[0];
+  const spawn = spawnParamsFor(params, item);
+  const prompt = renderSubagentPrompt({
+    name: "task",
+    description: "General",
+    systemPrompt: "Work carefully.",
+    source: "bundled",
+  }, spawn);
+
+  assert.equal(spawn.role, "Rust async-runtime specialist");
+  assert.match(prompt, /# Specialist Role/);
+  assert.match(prompt, /Rust async-runtime specialist/);
+  assert.match(prompt, /# Shared Context\nShared facts/);
 });
 
 test("task discovers OMP project agents before bundled agents", async () => {
@@ -1084,6 +1153,7 @@ test("task parses OMP-style agent frontmatter", () => {
     "tools: read, search, find",
     "spawns: *",
     "blocking: true",
+    "output: {\"properties\":{\"ok\":{\"type\":\"boolean\"}}}",
     "---",
     "Review carefully.",
   ].join("\n"), "project");
@@ -1093,7 +1163,131 @@ test("task parses OMP-style agent frontmatter", () => {
   assert.deepEqual(agent.tools, ["read", "search", "find"]);
   assert.equal(agent.spawns, "*");
   assert.equal(agent.blocking, true);
+  assert.deepEqual(agent.output, { properties: { ok: { type: "boolean" } } });
   assert.match(agent.systemPrompt, /Review carefully/);
+});
+
+test("task validates structured agent output with OMP-style JTD schema", () => {
+  const schema = {
+    properties: {
+      ok: { type: "boolean" },
+      verdict: { enum: ["pass", "fail"] },
+    },
+    optionalProperties: {
+      findings: {
+        elements: {
+          properties: {
+            title: { type: "string" },
+          },
+        },
+      },
+    },
+  };
+
+  assert.equal(validateAgentOutput(JSON.stringify({ ok: true, verdict: "pass", findings: [{ title: "Good" }] }), schema).ok, true);
+  const invalid = validateAgentOutput(JSON.stringify({ ok: "yes", verdict: "maybe" }), schema);
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.errors.join("\n"), /\$\.ok must be boolean/);
+  assert.match(invalid.errors.join("\n"), /\$\.verdict must be one of/);
+});
+
+test("task summary surfaces validation errors and salvaged progress", () => {
+  const rendered = renderTaskSummary({
+    index: 0,
+    id: "ReviewAPI",
+    agent: "task",
+    agentSource: "bundled",
+    task: "Review API",
+    assignment: "Review API",
+    role: "API specialist",
+    displayName: "API specialist",
+    description: "Review API",
+    exitCode: 1,
+    output: "- read: src/api.ts looked relevant",
+    stderr: "Output schema validation failed: $.ok must be boolean",
+    truncated: false,
+    durationMs: 1200,
+    requests: 2,
+  });
+
+  assert.match(rendered, /Task ReviewAPI \(API specialist\) failed/);
+  assert.match(rendered, /Role: API specialist/);
+  assert.match(rendered, /Output schema validation failed/);
+  assert.match(rendered, /Partial output/);
+  assert.match(rendered, /src\/api\.ts looked relevant/);
+});
+
+test("task recursive spawning follows OMP-style depth and allowlist rules", () => {
+  assert.equal(canSpawnAtDepth(2, 0), true);
+  assert.equal(canSpawnAtDepth(2, 1), true);
+  assert.equal(canSpawnAtDepth(2, 2), false);
+  assert.equal(canSpawnAtDepth(-1, 200), true);
+
+  assert.equal(isAgentSpawnAllowed("explore", "*"), true);
+  assert.equal(isAgentSpawnAllowed("explore", ["explore"]), true);
+  assert.equal(isAgentSpawnAllowed("task", ["explore"]), false);
+  assert.equal(isAgentSpawnAllowed("explore", ""), false);
+
+  assert.deepEqual(normalizeSpawnAllowance("*"), "*");
+  assert.deepEqual(normalizeSpawnAllowance(["explore"]), ["explore"]);
+  assert.equal(normalizeSpawnAllowance(undefined), "");
+
+  assert.equal(validateSpawnPermission({
+    agentName: "explore",
+    allowedSpawns: ["explore"],
+    taskDepth: 1,
+    maxRecursionDepth: 2,
+  }), undefined);
+  assert.match(validateSpawnPermission({
+    agentName: "task",
+    allowedSpawns: ["explore"],
+    taskDepth: 1,
+    maxRecursionDepth: 2,
+  }), /Allowed: explore/);
+  assert.match(validateSpawnPermission({
+    agentName: "reviewer",
+    allowedSpawns: "*",
+    blockedAgent: "reviewer",
+    taskDepth: 1,
+    maxRecursionDepth: 2,
+  }), /recursion prevention/);
+  assert.match(validateSpawnPermission({
+    agentName: "explore",
+    allowedSpawns: "*",
+    taskDepth: 2,
+    maxRecursionDepth: 2,
+  }), /Maximum task recursion depth/);
+});
+
+test("task exposes child task tool only for spawn-capable agents and strips it in plan mode", () => {
+  const agent = {
+    name: "plan",
+    description: "Planning",
+    systemPrompt: "Plan.",
+    tools: ["read", "search"],
+    spawns: ["explore"],
+    source: "bundled",
+  };
+
+  assert.deepEqual(agentToolNames({ agent, taskDepth: 0, maxRecursionDepth: 2 }), ["read", "search", "task"]);
+  assert.deepEqual(agentToolNames({ agent, taskDepth: 2, maxRecursionDepth: 2 }), ["read", "search"]);
+  assert.deepEqual(agentToolNames({ agent, taskDepth: 0, maxRecursionDepth: 2, planModeActive: true }), ["read", "search"]);
+
+  const planModeAgent = agentForPlanMode({
+    ...agent,
+    tools: ["read", "search", "bash", "report_finding", "task"],
+  });
+  assert.equal(planModeAgent.spawns, undefined);
+  assert.deepEqual(planModeAgent.tools, ["read", "search", "find", "lsp", "web_search", "report_finding"]);
+  assert.match(planModeAgent.systemPrompt, /Plan mode active/);
+});
+
+test("task allocates OMP-style nested output ids under parent agents", () => {
+  const existing = new Set(["Parent.Child", "Parent.Child2", "Other"]);
+
+  assert.equal(allocateNestedTaskId("Child", existing, "Parent"), "Parent.Child3");
+  assert.equal(allocateNestedTaskId("Review API", existing, "Parent"), "Parent.ReviewAPI");
+  assert.equal(allocateNestedTaskId("Root", existing), "Root");
 });
 
 test("bundled reviewer agent mirrors OMP review contract", async () => {
@@ -1284,11 +1478,12 @@ test("commit core extracts patches for hunk staging", () => {
 test("task description lists agents and Alpha host limitations", () => {
   const rendered = renderTaskDescription([
     { name: "explore", description: "Read-only scan", tools: ["read", "search"], systemPrompt: "", source: "bundled" },
-    { name: "task", description: "General work", systemPrompt: "", source: "bundled" },
+    { name: "task", description: "General work", systemPrompt: "", spawns: "*", source: "bundled" },
   ], { asyncEnabled: true, batchEnabled: true, maxConcurrency: 4 });
 
   assert.match(rendered, /Spawns subagents to work in the background/);
   assert.match(rendered, /# explore - READ-ONLY/);
+  assert.match(rendered, /recursively spawn child agents/);
   assert.match(rendered, /isolated git worktrees, IRC keep-alive/);
 });
 
@@ -1358,7 +1553,17 @@ test("plan mode exposes OMP-style read-only tool surface with resolve", () => {
   const ctx = makeToolContext({ planMode: createPlanModeState("inspect before editing") });
   const names = getAdvertisedAlphaLanguageModelTools({ ctx, includeDiscoverable: true, forceTools: ["resolve"] }).map((tool) => tool.name);
 
-  assert.deepEqual(names, ["read", "search", "find", "web_search", "ask", "write", "lsp", "resolve", "todo"]);
+  assert.deepEqual(names, ["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "resolve", "todo"]);
+});
+
+test("plan mode prompts OMP-style parallel explore subagents for broad planning", () => {
+  const ctx = makeToolContext({ planMode: createPlanModeState("inspect before editing") });
+  const prompt = planModeSystemPrompt(ctx);
+
+  assert.match(prompt, /parallel `explore` subagents/);
+  assert.match(prompt, /agent: "explore"/);
+  assert.match(prompt, /execution spec, not a design doc/);
+  assert.match(prompt, /fresh implementer/);
 });
 
 test("plan mode blocks workspace writes and allows local plan artifacts", () => {
@@ -1381,6 +1586,7 @@ test("plan review can display an approved inactive plan for retry", () => {
   const rendered = renderPlanReview(state);
 
   assert.match(rendered, /Status: approved for implementation/);
+  assert.match(rendered, /approve and implement as goal/);
   assert.match(rendered, /approve and implement/);
   assert.match(rendered, /refine: <change>/);
   assert.match(rendered, /Goal: update hello\.py safely/);
@@ -1399,6 +1605,121 @@ test("plan review distinguishes pending approval from retryable approved plan", 
   assert.match(renderPlanReview(pending), /Status: waiting for user approval/);
   assert.match(renderPlanReview(retryable), /Status: approved for implementation/);
   assert.doesNotMatch(renderPlanReview(retryable), /waiting for user approval/);
+});
+
+test("plan approval goal bridge detects goal approvals and preserves plan objective", () => {
+  assert.equal(isPlanApprovalAsGoalPrompt("approve and implement as goal"), true);
+  assert.equal(isPlanApprovalAsGoalPrompt("approved as a goal, go ahead"), true);
+  assert.equal(isPlanApprovalAsGoalPrompt("approve and implement"), false);
+  assert.equal(isPlanApprovalAsGoalPrompt("refine goal section"), false);
+
+  const objective = buildPlanGoalObjective(
+    "# Plan\n\n1. Read src/app.ts\n2. Edit tests",
+    "local://alpha-plan.md",
+    "approve and implement as goal",
+  );
+
+  assert.match(objective, /Implement the approved Alpha plan at local:\/\/alpha-plan\.md/);
+  assert.match(objective, /# Plan/);
+  assert.match(objective, /1\. Read src\/app\.ts/);
+  assert.match(objective, /User approval message/);
+  assert.match(objective, /approve and implement as goal/);
+});
+
+test("goal core matches OMP create resume complete drop semantics", () => {
+  const created = createGoal(undefined, "Ship release", 100);
+  assert.equal(created.enabled, true);
+  assert.equal(created.goal.objective, "Ship release");
+  assert.equal(created.goal.status, "active");
+  assert.equal(created.goal.tokenBudget, 100);
+  assert.equal(remainingTokens(created.goal), 100);
+
+  assert.throws(
+    () => createGoal(created, "Another goal"),
+    /cannot create a new goal because this session already has a goal/,
+  );
+
+  const paused = { ...created, enabled: false, goal: { ...created.goal, status: "paused" } };
+  const resumed = resumeGoal(paused);
+  assert.equal(resumed.enabled, true);
+  assert.equal(resumed.goal.status, "active");
+
+  const budgeted = updateGoalBudget(resumed, 50);
+  assert.equal(budgeted.goal.tokenBudget, 50);
+
+  const completed = completeGoal(budgeted);
+  assert.equal(completed.enabled, false);
+  assert.equal(completed.mode, "exiting");
+  assert.equal(completed.reason, "completed");
+  assert.equal(completed.goal.status, "complete");
+
+  const dropped = dropGoal(created);
+  assert.equal(dropped.status, "dropped");
+});
+
+test("goal prompt and command parsing follow OMP-style objective contract", () => {
+  const state = createGoalState("Fix <auth> & ship", 100);
+  const prompt = goalModeSystemPrompt(state);
+
+  assert.match(prompt, /Goal mode is active/);
+  assert.match(prompt, /Fix &lt;auth&gt; &amp; ship/);
+  assert.match(prompt, /hidden `goal` tool/);
+  assert.match(prompt, /Budget exhaustion is not completion/);
+  assert.match(prompt, /Treat natural follow-ups like `continue`/);
+  assert.deepEqual(parseGoalCommand("status"), { op: "get" });
+  assert.deepEqual(parseGoalCommand("resume"), { op: "resume" });
+  assert.deepEqual(parseGoalCommand("complete"), { op: "complete" });
+  assert.deepEqual(parseGoalCommand("drop"), { op: "drop" });
+  assert.deepEqual(parseGoalCommand("budget 1200"), { op: "budget", tokenBudget: 1200 });
+  assert.deepEqual(parseGoalCommand("set Improve Glue runtime"), { op: "create", objective: "Improve Glue runtime" });
+});
+
+test("goal continuation hint only appears for active unfinished goals", () => {
+  const active = createGoalState("Ship Alpha");
+  const completed = completeGoal(active);
+  const paused = { ...active, enabled: false, goal: { ...active.goal, status: "paused" } };
+
+  assert.equal(isGoalContinuationActive(active), true);
+  assert.equal(isGoalContinuationActive(completed), false);
+  assert.equal(isGoalContinuationActive(paused), false);
+  assert.match(renderGoalContinuationHint(active), /reply naturally/);
+  assert.match(renderGoalContinuationHint(active), /keep going/);
+  assert.equal(renderGoalContinuationHint(completed), "");
+  assert.equal(renderGoalContinuationHint(paused), "");
+});
+
+test("goal tool mutates persisted context through setGoalMode", async () => {
+  let goalMode;
+  const ctx = makeToolContext();
+  ctx.setGoalMode = (state) => {
+    goalMode = state;
+    ctx.goalMode = state;
+  };
+
+  const created = await goalTool.run(JSON.stringify({ op: "create", objective: "Ship Alpha", token_budget: 25 }), ctx);
+  assert.match(created.markdown, /Goal: Ship Alpha/);
+  assert.equal(goalMode.goal.status, "active");
+  assert.equal(goalMode.goal.tokenBudget, 25);
+
+  const got = await goalTool.run(JSON.stringify({ op: "get" }), ctx);
+  assert.match(got.markdown, /Remaining tokens: 25/);
+
+  const completed = await goalTool.run(JSON.stringify({ op: "complete" }), ctx);
+  assert.match(completed.markdown, /Status: complete/);
+  assert.equal(goalMode.goal.status, "complete");
+
+  const dropped = await goalTool.run(JSON.stringify({ op: "drop" }), ctx);
+  assert.match(dropped.markdown, /Status: dropped/);
+  assert.equal(goalMode, undefined);
+});
+
+test("system prompt injects active goal context and forced goal tool", () => {
+  const ctx = makeToolContext({ goalMode: createGoalState("Complete the migration") });
+  const prompt = buildAlphaSystemPrompt(ctx, { ctx, forceTools: ["goal"] });
+
+  assert.match(prompt, /# Goal Mode/);
+  assert.match(prompt, /Complete the migration/);
+  assert.match(prompt, /`goal`: Manage the active OMP-style goal-mode objective/);
 });
 
 

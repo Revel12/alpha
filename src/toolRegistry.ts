@@ -29,7 +29,7 @@ export interface AlphaToolSelection {
 }
 
 export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "bash", "edit"] as const;
-const PLAN_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "todo", "resolve"]);
+const PLAN_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo", "resolve"]);
 
 const stringProperty = (description: string): object => ({ type: "string", description });
 const alwaysEnabled = (): boolean => true;
@@ -351,6 +351,7 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
             properties: {
               id: stringProperty("Stable agent id, CamelCase, <=32 chars; generated when omitted."),
               description: stringProperty("UI label only; subagent does not see it."),
+              role: stringProperty("Specialist role/expertise this subagent should embody. The role shapes subagent identity and prompt context."),
               assignment: stringProperty("Complete, self-contained instructions. Include exact files, non-goals, and acceptance criteria."),
               isolated: { type: "boolean", description: "OMP compatibility field. Alpha reports this unsupported in the VS Code host." },
             },
@@ -449,6 +450,23 @@ export const alphaToolRegistry: readonly AlphaToolRegistration[] = [
     ),
     enabled: alwaysEnabled,
     loadTool: async () => (await import("./tools/yield.js")).yieldTool,
+    toArgs: (input) => JSON.stringify(input),
+  },
+  {
+    name: "goal",
+    visibility: "hidden",
+    loadMode: "discoverable",
+    description: "Manage the active OMP-style goal-mode objective with create, get, resume, complete, and drop operations. Only call complete after verifying every deliverable against current repo state.",
+    inputSchema: objectSchema(
+      {
+        op: { type: "string", enum: ["create", "get", "complete", "resume", "drop"], description: "Goal operation." },
+        objective: stringProperty("Goal objective. Required when op=create."),
+        token_budget: { type: "number", description: "Optional positive integer token budget for op=create." },
+      },
+      ["op"],
+    ),
+    enabled: (ctx) => !ctx || Boolean(ctx.goalMode),
+    loadTool: async () => (await import("./tools/goal.js")).goalTool,
     toArgs: (input) => JSON.stringify(input),
   },
   {

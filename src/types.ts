@@ -24,8 +24,14 @@ export interface AlphaContext {
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
   planMode?: PlanModeState;
+  goalMode?: GoalModeState;
+  taskDepth?: number;
+  taskAllowedSpawns?: string[] | "*" | "";
+  taskBlockedAgent?: string;
+  taskOutputPrefix?: string;
   persistSession?: () => void;
   setCompaction?: (summary: string, compactedThroughHistoryIndex: number) => void;
+  setGoalMode?: (state: GoalModeState | undefined) => void;
 }
 
 export interface ToolResult {
@@ -161,4 +167,24 @@ export interface PlanModeState {
   approvedPlan?: string;
   approvedPlanPath?: string;
   pendingApproval?: boolean;
+}
+
+export type GoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
+
+export interface Goal {
+  id: string;
+  objective: string;
+  status: GoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GoalModeState {
+  enabled: boolean;
+  mode: "active" | "exiting";
+  reason?: "completed";
+  goal: Goal;
 }

@@ -24,6 +24,7 @@ import type {
   PendingEdit,
   PendingEditStore,
   PlanModeState,
+  GoalModeState,
   PermissionDecisionStore,
   TodoItem,
   TodoPhase,
@@ -51,6 +52,7 @@ export interface AlphaSessionState {
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
   planMode?: PlanModeState;
+  goalMode?: GoalModeState;
 }
 
 export class AlphaSessionManager {
@@ -168,6 +170,7 @@ function createSessionState(
     permissionDecisions: new InMemoryPermissionDecisionStore(),
     discoveredTools: new InMemoryDiscoveredToolStore(persisted?.discoveredTools ?? [], notifyChanged),
     planMode: persisted?.planMode,
+    goalMode: persisted?.goalMode,
   };
   return state;
 }
@@ -187,6 +190,7 @@ function toPersistedSession(state: AlphaSessionState): PersistedSession {
     bashJobs: state.bashJobs.list().map(toPersistedBashJob),
     discoveredTools: state.discoveredTools.list(),
     planMode: state.planMode,
+    goalMode: state.goalMode,
   };
 }
 
@@ -251,6 +255,7 @@ interface PersistedSession {
   bashJobs?: BashJob[];
   discoveredTools?: string[];
   planMode?: PlanModeState;
+  goalMode?: GoalModeState;
 }
 
 interface PersistedArtifact {

@@ -16,18 +16,25 @@ import {
   DEFAULT_MAX_CONCURRENCY,
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_MAX_OUTPUT_LINES,
-  allocateTaskId,
+  DEFAULT_MAX_RECURSION_DEPTH,
+  agentForPlanMode,
+  agentToolNames,
+  allocateNestedTaskId,
   discoverAgents,
   getAgent,
+  normalizeSpawnAllowance,
   parseTaskInput,
   renderCombinedTaskResult,
   renderSubagentPrompt,
   renderTaskDescription,
   renderTaskSummary,
+  resolveSubagentDisplayName,
   resolveSpawnItems,
   spawnParamsFor,
   truncateTaskOutput,
+  validateAgentOutput,
   validateShapeParams,
+  validateSpawnPermission,
   validateSpawnParams,
   type AgentDefinition,
   type AgentProgress,
@@ -59,6 +66,14 @@ export const taskTool: ToolDefinition = {
     const batchEnabled = taskBatchEnabled();
     const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
     if (validationError) return { markdown: validationError };
+    const permissionError = validateSpawnPermission({
+      agentName: params.agent ?? "",
+      allowedSpawns: ctx.taskAllowedSpawns,
+      blockedAgent: ctx.taskBlockedAgent,
+      taskDepth: ctx.taskDepth,
+      maxRecursionDepth: taskMaxRecursionDepth(),
+    });
+    if (permissionError) return { markdown: permissionError };
 
     if (params.isolated || (params.tasks ?? []).some((task) => task.isolated)) {
       return {
@@ -67,10 +82,11 @@ export const taskTool: ToolDefinition = {
     }
 
     const { agents } = await discoverAgents(workspaceCwd());
-    const agent = getAgent(agents, params.agent ?? "");
-    if (!agent) {
+    const discoveredAgent = getAgent(agents, params.agent ?? "");
+    if (!discoveredAgent) {
       return { markdown: `Unknown agent "${params.agent ?? ""}". Available: ${agents.map((item) => item.name).join(", ") || "none"}` };
     }
+    const agent = ctx.planMode?.active ? agentForPlanMode(discoveredAgent) : discoveredAgent;
 
     const spawnItems = resolveSpawnItems(params);
     if (taskAsyncEnabled() && agent.blocking !== true) {
@@ -93,17 +109,18 @@ export async function taskDescription(): Promise<string> {
 }
 
 function startBackgroundTasks(params: TaskParams, agent: AgentDefinition, spawnItems: ReturnType<typeof resolveSpawnItems>, ctx: AlphaContext): string {
-  const existingIds = new Set(ctx.bashJobs.list().map((job) => job.id));
-  const started: Array<{ id: string; jobId: string; description?: string }> = [];
+  const existingIds = taskOutputIds(ctx);
+  const started: Array<{ id: string; jobId: string; description?: string; role?: string; displayName: string }> = [];
   for (let index = 0; index < spawnItems.length; index++) {
     const item = spawnItems[index];
-    const id = allocateTaskId(item.id, existingIds);
+    const id = allocateNestedTaskId(item.id, existingIds, ctx.taskOutputPrefix);
     existingIds.add(id);
     const spawnParams = spawnParamsFor(params, { ...item, id });
+    const displayName = resolveSubagentDisplayName(spawnParams.role, agent.name);
     const controller = new AbortController();
     const job = ctx.bashJobs.add({
       type: "task",
-      command: `${agent.name}: ${item.description ?? item.assignment ?? id}`,
+      command: `${displayName}: ${item.description ?? item.assignment ?? id}`,
       cwd: workspaceCwd(),
       status: "running",
     });
@@ -130,18 +147,19 @@ function startBackgroundTasks(params: TaskParams, agent: AgentDefinition, spawnI
         });
       })
       .finally(() => unregisterAsyncBashController(job.id));
-    started.push({ id, jobId: job.id, description: item.description });
+    started.push({ id, jobId: job.id, description: item.description, role: spawnParams.role, displayName });
   }
 
   if (started.length === 1) {
     const item = started[0];
     const suffix = item.description ? ` - ${item.description}` : "";
-    return `Spawned agent \`${item.id}\` (job \`${item.jobId}\`)${suffix}. The result will be stored on the job; use \`job\` to inspect, poll, or cancel it.`;
+    const role = item.role ? ` as ${item.displayName}` : "";
+    return `Spawned agent \`${item.id}\` (job \`${item.jobId}\`)${role}${suffix}. The result will be stored on the job; use \`job\` to inspect, poll, or cancel it.`;
   }
 
   return [
     `Spawned ${started.length} background agents using ${agent.name}. Each result will be stored on its job.`,
-    ...started.map((item) => `- \`${item.id}\` (job \`${item.jobId}\`)${item.description ? ` - ${item.description}` : ""}`),
+    ...started.map((item) => `- \`${item.id}\` (${item.displayName}, job \`${item.jobId}\`)${item.description ? ` - ${item.description}` : ""}`),
     "Use `job` to inspect, poll, or cancel them.",
   ].join("\n");
 }
@@ -153,6 +171,7 @@ async function runSpawnItems(
   ctx: AlphaContext,
 ): Promise<SingleResult[]> {
   const existingIds = new Set(ctx.bashJobs.list().map((job) => job.id));
+  for (const id of taskOutputIds(ctx)) existingIds.add(id);
   const results: SingleResult[] = new Array(spawnItems.length);
   let nextIndex = 0;
   const workerCount = Math.min(taskMaxConcurrency(), spawnItems.length);
@@ -161,7 +180,7 @@ async function runSpawnItems(
     while (nextIndex < spawnItems.length) {
       const index = nextIndex++;
       const item = spawnItems[index];
-      const id = allocateTaskId(item.id, existingIds);
+      const id = allocateNestedTaskId(item.id, existingIds, ctx.taskOutputPrefix);
       existingIds.add(id);
       results[index] = await runOneSpawn(spawnParamsFor(params, { ...item, id }), agent, ctx, index, id, ctx.token);
     }
@@ -181,6 +200,7 @@ async function runOneSpawn(
 ): Promise<SingleResult> {
   const startedAt = performance.now();
   const assignment = (params.assignment ?? "").trim();
+  const displayName = resolveSubagentDisplayName(params.role, agent.name);
   const progress: AgentProgress = {
     index,
     id,
@@ -190,6 +210,8 @@ async function runOneSpawn(
     task: assignment,
     assignment,
     description: params.description,
+    role: params.role,
+    displayName,
     recentOutput: [],
     toolCount: 0,
     requests: 0,
@@ -198,6 +220,15 @@ async function runOneSpawn(
 
   try {
     const output = await runSubagentModelLoop(parentCtx, agent, params, id, progress, token);
+    const validation = validateAgentOutput(output, agent.output);
+    if (!validation.ok) {
+      const salvage = formatProgressSalvage(progress);
+      throw new Error([
+        validation.errors.join("\n"),
+        salvage ? `\nRecent subagent activity before invalid output:\n${salvage}` : undefined,
+        output.trim() ? `\nReturned output:\n${output.trim()}` : undefined,
+      ].filter((line): line is string => typeof line === "string").join("\n"));
+    }
     const truncated = truncateTaskOutput(output, taskMaxOutputBytes(), taskMaxOutputLines());
     const artifact = parentCtx.artifacts.add(`task ${id} output`, output);
     return {
@@ -208,6 +239,8 @@ async function runOneSpawn(
       task: assignment,
       assignment,
       description: params.description,
+      role: params.role,
+      displayName,
       exitCode: 0,
       output: truncated.output,
       stderr: "",
@@ -219,6 +252,10 @@ async function runOneSpawn(
   } catch (error) {
     const aborted = isAborted(token);
     const message = error instanceof Error ? error.message : String(error);
+    const salvage = formatProgressSalvage(progress);
+    const stderr = salvage && !message.includes("Recent subagent activity")
+      ? `${message}\n\nRecent subagent activity:\n${salvage}`
+      : message;
     return {
       index,
       id,
@@ -227,9 +264,11 @@ async function runOneSpawn(
       task: assignment,
       assignment,
       description: params.description,
+      role: params.role,
+      displayName,
       exitCode: aborted ? 130 : 1,
-      output: "",
-      stderr: message,
+      output: salvage,
+      stderr,
       truncated: false,
       durationMs: Math.round(performance.now() - startedAt),
       requests: progress.requests,
@@ -247,8 +286,7 @@ async function runSubagentModelLoop(
   progress: AgentProgress,
   token: vscode.CancellationToken | AbortSignal,
 ): Promise<string> {
-  const activeTools = toolsForAgent(agent, parentCtx);
-  const activeToolNames = new Set(activeTools.map((tool) => tool.name));
+  const childDepth = (parentCtx.taskDepth ?? 0) + 1;
   const subagentCtx: AlphaContext = {
     ...parentCtx,
     sessionKey: `${parentCtx.sessionKey}:task:${id}`,
@@ -256,7 +294,13 @@ async function runSubagentModelLoop(
     compactionSummary: undefined,
     transcript: [],
     token: toCancellationToken(token),
+    taskDepth: childDepth,
+    taskAllowedSpawns: normalizeSpawnAllowance(agent.spawns),
+    taskBlockedAgent: agent.name,
+    taskOutputPrefix: id,
   };
+  const activeTools = toolsForAgent(agent, subagentCtx);
+  const activeToolNames = new Set(activeTools.map((tool) => tool.name));
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(
       wrapInternalForModel(renderSubagentPrompt(agent, params), "alpha-system"),
@@ -334,8 +378,12 @@ async function runSubagentModelLoop(
 }
 
 function toolsForAgent(agent: AgentDefinition, ctx: AlphaContext): vscode.LanguageModelChatTool[] {
-  const requested = (agent.tools?.length ? agent.tools : ["read", "bash", "search", "find", "edit", "write", "lsp", "job", "todo"])
-    .filter((name) => name !== "task");
+  const requested = agentToolNames({
+    agent,
+    taskDepth: ctx.taskDepth ?? 0,
+    maxRecursionDepth: taskMaxRecursionDepth(),
+    planModeActive: ctx.planMode?.active,
+  });
   return getAdvertisedAlphaLanguageModelTools({ ctx, forceTools: requested, onlyForced: true });
 }
 
@@ -394,6 +442,12 @@ function taskMaxConcurrency(): number {
   return Math.max(1, Math.min(16, vscode.workspace.getConfiguration("alpha").get<number>("task.maxConcurrency", DEFAULT_MAX_CONCURRENCY)));
 }
 
+function taskMaxRecursionDepth(): number {
+  const value = vscode.workspace.getConfiguration("alpha").get<number>("task.maxRecursionDepth", DEFAULT_MAX_RECURSION_DEPTH);
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_MAX_RECURSION_DEPTH;
+  return Math.max(-1, Math.min(20, Math.trunc(value)));
+}
+
 function taskMaxOutputBytes(): number {
   return Math.max(1000, vscode.workspace.getConfiguration("alpha").get<number>("task.maxOutputBytes", DEFAULT_MAX_OUTPUT_BYTES));
 }
@@ -414,6 +468,31 @@ function buildSubagentBudgetNotice(requests: number): string {
   return `[budget notice] You have used ${requests} requests in this run. Wrap up now: finish the current step and yield your final report.`;
 }
 
+function formatProgressSalvage(progress: AgentProgress): string {
+  const lines: string[] = [];
+  if (progress.recentOutput.length) lines.push(...progress.recentOutput.map((line) => `- ${flattenSnippet(line)}`));
+  if (!lines.length && progress.toolCount > 0) lines.push(`- ${progress.toolCount} tool call${progress.toolCount === 1 ? "" : "s"} completed before the run stopped.`);
+  if (!lines.length && progress.requests > 0) lines.push(`- ${progress.requests} model request${progress.requests === 1 ? "" : "s"} completed before the run stopped.`);
+  return lines.join("\n");
+}
+
+function flattenSnippet(text: string, maxLength = 700): string {
+  const flattened = text.replace(/\s+/g, " ").trim();
+  return flattened.length > maxLength ? `${flattened.slice(0, maxLength - 3)}...` : flattened;
+}
+
 function workspaceCwd(): string {
   return workspaceRoot().fsPath;
+}
+
+function taskOutputIds(ctx: AlphaContext): Set<string> {
+  const ids = new Set<string>();
+  for (const job of ctx.bashJobs.list()) {
+    if (job.type === "task") ids.add(job.id);
+  }
+  for (const artifact of ctx.artifacts.list()) {
+    const match = /^task\s+(.+?)\s+output$/i.exec(artifact.label.trim());
+    if (match) ids.add(match[1]);
+  }
+  return ids;
 }

@@ -44,6 +44,10 @@
             "description": "Show the current Alpha plan mode review state."
           },
           {
+            "name": "goal",
+            "description": "Manage an OMP-style persistent Alpha goal."
+          },
+          {
             "name": "compact",
             "description": "Compact Alpha chat history into a persistent summary."
           },
@@ -223,6 +227,11 @@
           "maximum": 200000,
           "description": "Recent in-flight tool-loop token budget kept verbatim when Alpha compacts older completed tool exchanges. Mirrors OMP's token-oriented keepRecentTokens shape."
         },
+        "alpha.goal.continuationHint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a short hint when an Alpha response ends while an OMP-style goal is still active. Natural follow-ups like continue or keep going resume the same goal."
+        },
         "alpha.tools.discoveryMode": {
           "type": "string",
           "enum": [
@@ -313,6 +322,13 @@
           "minimum": 1,
           "maximum": 16,
           "description": "Maximum task subagents running concurrently in one Alpha task call."
+        },
+        "alpha.task.maxRecursionDepth": {
+          "type": "number",
+          "default": 2,
+          "minimum": -1,
+          "maximum": 20,
+          "description": "Maximum OMP-style nested task depth. 0 disables child task spawning; -1 removes the cap. Plan-mode subagents still cannot spawn children."
         },
         "alpha.task.maxOutputBytes": {
           "type": "number",

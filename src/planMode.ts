@@ -12,6 +12,26 @@ export function createPlanModeState(initialPrompt?: string): PlanModeState {
   };
 }
 
+export function isPlanApprovalAsGoalPrompt(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  if (!/\bgoal\b/.test(text)) return false;
+  return /\b(approve|approved|apply|implement|execute|proceed|go ahead|start)\b/.test(text);
+}
+
+export function buildPlanGoalObjective(plan: string, planPath: string, userApprovalMessage?: string): string {
+  const parts = [
+    `Implement the approved Alpha plan at ${planPath}.`,
+    "",
+    "Approved plan:",
+    plan.trim(),
+  ];
+  const trimmedMessage = userApprovalMessage?.trim();
+  if (trimmedMessage) {
+    parts.push("", "User approval message:", trimmedMessage);
+  }
+  return parts.join("\n");
+}
+
 export function updatePlanMode(state: PlanModeState, patch: Partial<PlanModeState>): PlanModeState {
   Object.assign(state, patch, { updatedAt: new Date().toISOString() });
   return state;
@@ -38,11 +58,19 @@ export function planModeSystemPrompt(ctx: AlphaContext): string | undefined {
     "# Plan Mode",
     "- You are in OMP-style plan mode. Explore and plan before implementation.",
     "- The workspace is read-only: do not call mutating workspace tools. `edit` is unavailable, and `write` may only target `local://` plan or scratch artifacts.",
-    "- Use `read`, `search`, `find`, `web_search`, `lsp`, `ask`, and `todo` for investigation and planning.",
+    "- Use `read`, `search`, `find`, `web_search`, `lsp`, `task`, `ask`, and `todo` for investigation and planning.",
+    "- Ground every discoverable fact yourself. Every path, symbol, signature, current behavior, test pattern, and config statement in the plan must come from code or docs read in this plan session. Mark anything unverified inline.",
+    "- For broad, ambiguous, cross-cutting, or multi-area work, launch parallel `explore` subagents with `task` before finalizing the plan. Give each subagent a distinct focus such as existing implementation, affected callsites, tests, edge cases, or risky integrations.",
+    "- Use `task` in one OMP-style batch call when possible: `agent: \"explore\"`, shared `context`, and `tasks: [{ id?, description?, assignment }]`. Keep assignments self-contained with exact paths or discovery targets, explicit non-goals, and concise acceptance criteria.",
+    "- Plan-mode subagents are for investigation only. Prefer read-only agents such as `explore` and do not ask subagents to edit files, run mutating commands, format, lint, or run project-wide tests.",
+    "- After subagents return, synthesize their reports yourself. Subagents provide evidence; you own the design decision and final plan.",
+    "- Ask the user only for preferences or tradeoffs not derivable from repository exploration. Batch questions and recommend a default.",
     `- Keep the current draft plan in \`${planPath}\`; use \`write\` to update that local URL.`,
+    "- The plan is an execution spec, not a design doc. It must be self-contained enough that a fresh implementer can execute it without this conversation and without making design decisions.",
+    "- Plan contents should cover: context, ordered approach, critical files/anchors, verification, and assumptions/contingencies. Omit decision-free sections such as generic risks, future work, or alternatives unless they settle a concrete implementation choice.",
     "- When the plan is ready for user approval, call hidden `resolve` with `action: \"apply\"`, a concise `reason`, and optional `extra: { \"planPath\": \"local://...\" }`.",
     "- `resolve apply` submits the plan for user approval only. It must not start implementation in the same turn.",
-    "- Implementation begins only after a later explicit user approval such as 'approve and implement'.",
+    "- Implementation begins only after a later explicit user approval such as 'approve and implement' or 'approve and implement as goal'.",
     "- If the user asks to revise the plan, call `resolve` with `action: \"refine\"` and continue planning.",
     "- If the plan should be abandoned, call `resolve` with `action: \"discard\"`.",
     pendingApproval ? "- A plan is currently waiting for user approval. Do not implement it or call mutating tools until explicit approval. You may answer unrelated side questions normally." : undefined,
@@ -72,7 +100,7 @@ export function renderPlanReview(state: PlanModeState): string {
         ? "Status: approved for implementation."
         : undefined;
   const nextStep = state.pendingApproval || (!state.active && state.approvedPlan)
-    ? "Reply `approve and implement`, `refine: <change>`, or `discard plan`."
+    ? "Reply `approve and implement as goal`, `approve and implement`, `refine: <change>`, or `discard plan`."
     : "Use plan mode to draft a plan, then submit it for approval.";
   const lines = [
     "Alpha plan review",
