@@ -12,6 +12,8 @@ import {
   deactivateBlueprintMode,
   isBlueprintGeneratePrompt,
   parseBlueprintTemplate,
+  parseBlueprintTemplateSelection,
+  renderBlueprintTemplateQuestion,
   renderBlueprintStatus,
   setBlueprintTemplate,
 } from "./blueprintMode";
@@ -31,7 +33,15 @@ import {
   updateGoalBudget,
 } from "./goalMode";
 import { resolveInternalUrl } from "./internalUrls";
-import { buildPlanGoalObjective, createPlanModeState, isPlanApprovalAsGoalPrompt, renderPlanModeStatus, renderPlanReview } from "./planMode";
+import {
+  buildPlanGoalObjective,
+  buildPlanOpenQuestionsPrompt,
+  createPlanModeState,
+  isPlanApprovalAsGoalPrompt,
+  isPlanOpenQuestionsPrompt,
+  renderPlanModeStatus,
+  renderPlanReview,
+} from "./planMode";
 import { buildInteractiveReviewPrompt } from "./reviewCore";
 import { workspaceRoot } from "./workspace";
 
@@ -358,7 +368,8 @@ async function handleBlueprintCommand(
 
   const template = parseBlueprintTemplate(trimmed);
   if (template && session.blueprintMode?.active && /^template\b/i.test(trimmed)) {
-    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, template);
+    const selection = parseBlueprintTemplateSelection(trimmed.replace(/^template\b\s*/i, "")) ?? { template };
+    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, selection.template, selection.customTemplatePrompt);
     ctx.blueprintMode = session.blueprintMode;
     sessions.persistNow();
     ctx.stream.markdown(renderBlueprintStatus(session.blueprintMode));
@@ -375,10 +386,10 @@ async function handleBlueprintCommand(
     return;
   }
 
-  session.blueprintMode = createBlueprintModeState(trimmed, template ?? "default");
+  session.blueprintMode = createBlueprintModeState(trimmed);
   ctx.blueprintMode = session.blueprintMode;
   sessions.persistNow();
-  await answerWithAlphaTools(buildBlueprintStartPrompt(session.blueprintMode.refinedPrompt), ctx);
+  ctx.stream.markdown(renderBlueprintTemplateQuestion(session.blueprintMode));
 }
 
 async function continueBlueprint(
@@ -390,15 +401,32 @@ async function continueBlueprint(
     ctx.stream.markdown("No active Alpha blueprint. Start one with `@a /blueprint <request>`.");
     return;
   }
+  if (!session.blueprintMode.templateSelected) {
+    const selection = parseBlueprintTemplateSelection(prompt);
+    if (!selection) {
+      ctx.stream.markdown(renderBlueprintTemplateQuestion(session.blueprintMode, "I could not determine the template selection."));
+      return;
+    }
+    if (selection.template === "custom" && !selection.customTemplatePrompt) {
+      ctx.stream.markdown(renderBlueprintTemplateQuestion(session.blueprintMode, "For `Other`, include the custom plan structure or level of detail, for example `1c: Overview, Risks, Steps, Tests`."));
+      return;
+    }
+    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, selection.template, selection.customTemplatePrompt);
+    ctx.blueprintMode = session.blueprintMode;
+    sessions.persistNow();
+    await answerWithAlphaTools(buildBlueprintStartPrompt(session.blueprintMode), ctx);
+    return;
+  }
   const template = parseBlueprintTemplate(prompt);
   if (template && /^template\b/i.test(prompt)) {
-    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, template);
+    const selection = parseBlueprintTemplateSelection(prompt.replace(/^template\b\s*/i, "")) ?? { template };
+    session.blueprintMode = setBlueprintTemplate(session.blueprintMode, selection.template, selection.customTemplatePrompt);
   } else {
     session.blueprintMode = appendBlueprintAnswer(session.blueprintMode, prompt);
   }
   ctx.blueprintMode = session.blueprintMode;
   sessions.persistNow();
-  await answerWithAlphaTools(buildBlueprintContinuePrompt(prompt), ctx);
+  await answerWithAlphaTools(buildBlueprintContinuePrompt(prompt, session.blueprintMode.refinedPrompt), ctx);
 }
 
 async function generatePlanFromBlueprint(
@@ -415,33 +443,73 @@ async function generatePlanFromBlueprint(
     ctx.stream.markdown("A plan is already active or waiting for approval.");
     return;
   }
+  if (!blueprint.templateSelected) {
+    ctx.stream.markdown(renderBlueprintTemplateQuestion(blueprint, "Choose a template before generating the plan."));
+    return;
+  }
 
   const template = parseBlueprintTemplate(prompt);
   const nextBlueprint = deactivateBlueprintMode(template ? setBlueprintTemplate(blueprint, template) : blueprint);
+  const refinedPrompt = await blueprintRefinedPromptForGeneration(nextBlueprint, ctx);
+  nextBlueprint.refinedPrompt = refinedPrompt;
   session.blueprintMode = nextBlueprint;
   ctx.blueprintMode = nextBlueprint;
-  session.planMode = createPlanModeState(nextBlueprint.refinedPrompt);
+  session.planMode = createPlanModeState(refinedPrompt);
   ctx.planMode = session.planMode;
   sessions.persistNow();
 
   await answerWithAlphaTools(buildBlueprintGeneratePrompt(nextBlueprint), ctx);
 }
 
-function buildBlueprintStartPrompt(refinedPrompt: string): string {
+async function blueprintRefinedPromptForGeneration(
+  state: NonNullable<AlphaSessionState["blueprintMode"]>,
+  ctx: AlphaContext,
+): Promise<string> {
+  try {
+    const resource = await resolveInternalUrl(state.blueprintPath, ctx);
+    const content = resource.content.trim();
+    return content || state.refinedPrompt;
+  } catch {
+    return state.refinedPrompt;
+  }
+}
+
+function buildBlueprintStartPrompt(state: NonNullable<AlphaSessionState["blueprintMode"]>): string {
   return [
     "Start Alpha Blueprint mode for this request.",
+    `Selected template: ${state.template}${state.customTemplatePrompt ? ` (${state.customTemplatePrompt})` : ""}.`,
     "Investigate enough to ask useful questions. Use read-only explore subagents with task fanout when the work is broad.",
-    "Ask the first 3-5 clarifying questions unless the request is already fully specified. Do not generate the plan yet.",
+    "Ask the first 3-5 clarifying questions unless the request is already fully specified.",
+    "Questions must match the selected template's level and perspective. For concise templates, avoid deep implementation-detail questions unless necessary.",
+    "Users generally expect to continue existing patterns and expand their system; only question existing patterns when the requested change clearly conflicts with them.",
+    "Focus on decisions that meaningfully affect implementation, not trivial or obvious choices.",
+    "Use Blueprint-style inline questions with **Q1. ...**, brief context, lettered choices, and a final Other (describe) choice where options fit.",
+    "Leave two blank lines between questions and a blank line between the question text, context line, and options.",
+    "Include the shorthand-answer hint before the questions. Do not generate the plan yet.",
+    "When you ask questions, also write the current refined prompt to local://alpha-blueprint.md in Blueprint format: original request exactly, then `*` clarification bullets inserted in logical locations near related content.",
     "",
-    refinedPrompt,
+    state.refinedPrompt,
   ].join("\n");
 }
 
-function buildBlueprintContinuePrompt(userAnswer: string): string {
+function buildBlueprintContinuePrompt(userAnswer: string, refinedPrompt: string): string {
   return [
     "Continue Alpha Blueprint mode with this user answer or refinement.",
-    "Update your understanding, investigate further if needed, then either ask the next 3-5 useful questions or say the blueprint is ready for `/blueprint-generate`.",
+    "Acknowledge briefly, show the updated refined prompt in a blockquote, then ask 3-5 more questions.",
+    "Do not repeat questions whose answers are already captured in the refined prompt or prior chat. Do not ask about choices already settled by this answer.",
+    "The next questions may be follow-ups to the user's answers or additional new/ambiguous topics that still need to be discussed.",
+    "Keep asking question rounds until the user runs `/blueprint-generate`. Do not stop asking questions on your own.",
+    "Questions must match the selected template's level and perspective. For concise templates, avoid deep implementation-detail questions unless necessary.",
+    "Users generally expect to continue existing patterns and expand their system; only question existing patterns when the requested change clearly conflicts with them.",
+    "Focus on decisions that meaningfully affect implementation, not trivial or obvious choices.",
+    "Use Blueprint-style inline questions with **Q1. ...**, brief context, lettered choices, and a final Other (describe) choice where options fit.",
+    "Leave two blank lines between questions and a blank line between the question text, context line, and options.",
+    "Update local://alpha-blueprint.md with the current refined prompt in Blueprint format: original request exactly, then `*` clarification bullets inserted in logical locations near related content.",
+    "After the questions, remind the user to run `/blueprint-generate` when ready to end Q&A and generate the plan.",
     "Do not generate the plan yet.",
+    "",
+    "Current stored refined prompt:",
+    refinedPrompt,
     "",
     userAnswer,
   ].join("\n");
@@ -511,6 +579,11 @@ async function handlePlanReviewCommand(
   }
 
   const contextUsage = await alphaContextUsageForPrompt("plan review", ctx);
+  if (isPlanOpenQuestionsPrompt(prompt)) {
+    await answerWithAlphaTools(buildPlanOpenQuestionsPrompt(plan, planPath), ctx);
+    return;
+  }
+
   if (!state.active && state.approvedPlan && !state.pendingApproval) {
     ctx.stream.markdown([
       renderPlanReview(state),
@@ -563,6 +636,21 @@ async function handlePlanDecisionPrompt(
 
     ctx.stream.markdown(`${renderPlanReview(state)}\n\nRefining the plan from your instructions.\n\n`);
     await answerWithAlphaTools(`Refine the pending Alpha plan with this user instruction: ${refinement}`, ctx);
+    return true;
+  }
+
+  if (isPlanOpenQuestionsPrompt(prompt)) {
+    const planPath = state.approvedPlanPath ?? state.planPath;
+    let plan = state.approvedPlan;
+    if (!plan) {
+      try {
+        plan = (await resolveInternalUrl(planPath, ctx)).content;
+      } catch {
+        ctx.stream.markdown("No plan to review yet. Ask Alpha to write one to `local://alpha-plan.md` first.");
+        return true;
+      }
+    }
+    await answerWithAlphaTools(buildPlanOpenQuestionsPrompt(plan, planPath), ctx);
     return true;
   }
 

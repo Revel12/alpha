@@ -174,9 +174,11 @@ import {
 } from "../out/pythonStaticChecks.js";
 import {
   buildPlanGoalObjective,
+  buildPlanOpenQuestionsPrompt,
   assertPlanModeWriteAllowed,
   createPlanModeState,
   isPlanApprovalAsGoalPrompt,
+  isPlanOpenQuestionsPrompt,
   planModeSystemPrompt,
   renderPlanReview,
 } from "../out/planMode.js";
@@ -187,6 +189,8 @@ import {
   buildBlueprintGeneratePrompt,
   createBlueprintModeState,
   isBlueprintGeneratePrompt,
+  parseBlueprintTemplateSelection,
+  renderBlueprintTemplateQuestion,
   renderBlueprintStatus,
 } from "../out/blueprintMode.js";
 import {
@@ -1589,32 +1593,76 @@ test("blueprint mode exposes read-only planning tools with task fanout", () => {
   const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("scope a risky auth refactor") });
   const names = getAdvertisedAlphaLanguageModelTools({ ctx, includeDiscoverable: true }).map((tool) => tool.name);
 
-  assert.deepEqual(names, ["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo"]);
+  assert.deepEqual(names, ["read", "search", "find", "web_search", "write", "lsp", "task", "todo"]);
+  assert.equal(names.includes("ask"), false);
   assert.equal(names.includes("edit"), false);
   assert.equal(names.includes("resolve"), false);
 });
 
 test("blueprint mode prompts Q&A and read-only explore subagents before plan generation", () => {
-  const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("replace the settings storage layer") });
+  const ctx = makeToolContext({ blueprintMode: createBlueprintModeState("replace the settings storage layer", "default") });
   const prompt = blueprintModeSystemPrompt(ctx);
 
   assert.match(prompt, /Blueprint mode is read-only/);
   assert.match(prompt, /parallel read-only `explore` subagents/);
   assert.match(prompt, /agent: "explore"/);
   assert.match(prompt, /Ask 3-5 concise questions/);
+  assert.match(prompt, /inline in chat/);
+  assert.match(prompt, /Answer with shorthand like `1a, 2b, 3e, 4a, 5b`/);
+  assert.match(prompt, /\*\*Q1\. Question text\*\*/);
+  assert.match(prompt, /Leave two blank lines between questions/);
+  assert.match(prompt, /blank line between the question text, context line, and options/);
+  assert.match(prompt, /Other \(describe\)/);
+  assert.match(prompt, /meaningfully affect the implementation, not trivial or obvious choices/);
+  assert.match(prompt, /match the level and perspective of the selected template/);
+  assert.match(prompt, /continue existing patterns and expand their system/);
+  assert.match(prompt, /Do not ask about implementation details unless the selected template explicitly calls for them/);
+  assert.match(prompt, /updated refined prompt in a blockquote/);
+  assert.match(prompt, /Do not repeat questions whose answers are already captured/);
+  assert.match(prompt, /Keep asking rounds of follow-up questions until the user runs/);
+  assert.match(prompt, /new\/ambiguous topics that still need to be discussed/);
+  assert.match(prompt, /insert new bullet points in logical locations near related content/);
+  assert.match(prompt, /one concise bullet per question-answer pair/);
+  assert.match(prompt, /The plan should contain EXACTLY the following sections in order/);
+  assert.match(prompt, /Implementation phases: Ordered phases/);
+  assert.doesNotMatch(prompt, /✓ Explore ● Plan ○ Write ○ Refine/);
+  assert.match(prompt, /Do not use popup\/UI question tools/);
   assert.match(prompt, /Do not implement code/);
   assert.match(prompt, /Do not generate the plan before that command/);
 });
 
+test("blueprint mode starts with explicit inline template selection", () => {
+  const state = createBlueprintModeState("replace the settings storage layer");
+  const question = renderBlueprintTemplateQuestion(state);
+
+  assert.equal(state.templateSelected, false);
+  assert.match(question, /\*\*Q1\. Which plan template should this Blueprint use\?\*\*/);
+  assert.match(question, /a\) Default/);
+  assert.match(question, /b\) Concise/);
+  assert.match(question, /c\) Other \(describe\)/);
+  assert.deepEqual(parseBlueprintTemplateSelection("1a"), { template: "default" });
+  assert.deepEqual(parseBlueprintTemplateSelection("1b"), { template: "concise" });
+  assert.deepEqual(parseBlueprintTemplateSelection("1c: Overview, Risks, Steps"), {
+    template: "custom",
+    customTemplatePrompt: "Overview, Risks, Steps",
+  });
+});
+
 test("blueprint mode records answers in the refined prompt and status", () => {
   const state = appendBlueprintAnswer(
-    createBlueprintModeState("add project import"),
+    createBlueprintModeState("add project import", "default"),
     "CSV and JSON should both be supported; keep existing imports compatible.",
   );
 
   assert.equal(state.rounds.length, 1);
-  assert.match(state.refinedPrompt, /User answers and refinements:/);
-  assert.match(state.refinedPrompt, /CSV and JSON should both be supported/);
+  assert.equal(
+    state.refinedPrompt,
+    [
+      "add project import",
+      "",
+      "* CSV and JSON should both be supported; keep existing imports compatible.",
+    ].join("\n"),
+  );
   assert.match(renderBlueprintStatus(state), /Answer rounds: 1/);
 });
 
@@ -1623,7 +1671,8 @@ test("blueprint generate prompt hands the refined request to plan mode", () => {
   const prompt = buildBlueprintGeneratePrompt(state);
 
   assert.match(prompt, /Generate an Alpha execution plan/);
-  assert.match(prompt, /concise plan template/);
+  assert.match(prompt, /Write a concise plan with three sections/);
+  assert.match(prompt, /Changes: What needs to change relative to the existing system, as bullet points without implementation details/);
   assert.match(prompt, /Write the plan to the active Alpha plan file/);
   assert.match(prompt, /Prefer the existing artifact store/);
   assert.equal(isBlueprintGeneratePrompt("ready to generate the plan"), true);
@@ -1666,8 +1715,31 @@ test("plan review distinguishes pending approval from retryable approved plan", 
   retryable.approvedPlan = "Goal: retryable.";
 
   assert.match(renderPlanReview(pending), /Status: waiting for user approval/);
+  assert.match(renderPlanReview(pending), /what are the open questions\?/);
   assert.match(renderPlanReview(retryable), /Status: approved for implementation/);
   assert.doesNotMatch(renderPlanReview(retryable), /waiting for user approval/);
+});
+
+test("plan review open questions prompt follows Blueprint question format", () => {
+  const prompt = buildPlanOpenQuestionsPrompt(
+    [
+      "# Plan",
+      "",
+      "- Open questions: Should tests cover the CLI path or only API behavior?",
+    ].join("\n"),
+    "local://alpha-plan.md",
+  );
+
+  assert.equal(isPlanOpenQuestionsPrompt("what are the open questions?"), true);
+  assert.equal(isPlanOpenQuestionsPrompt("show remaining questions to resolve"), true);
+  assert.equal(isPlanOpenQuestionsPrompt("approve and implement"), false);
+  assert.match(prompt, /output only unresolved questions/);
+  assert.match(prompt, /Do not modify files/);
+  assert.match(prompt, /Answer with shorthand like `1a, 2b, 3e`/);
+  assert.match(prompt, /\*\*Q1\. \[Question text\]\*\*/);
+  assert.match(prompt, /Other \(describe\)/);
+  assert.match(prompt, /Leave two blank lines between questions/);
+  assert.match(prompt, /Plan path: local:\/\/alpha-plan\.md/);
 });
 
 test("plan approval goal bridge detects goal approvals and preserves plan objective", () => {

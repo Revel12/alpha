@@ -179,7 +179,9 @@ export interface BlueprintModeState {
   active: boolean;
   createdAt: string;
   updatedAt: string;
-  template: "default" | "concise";
+  template: "default" | "concise" | "custom";
+  templateSelected: boolean;
+  customTemplatePrompt?: string;
   blueprintPath: string;
   originalPrompt: string;
   refinedPrompt: string;

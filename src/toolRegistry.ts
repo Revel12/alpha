@@ -31,7 +31,7 @@ export interface AlphaToolSelection {
 
 export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = ["read", "bash", "edit"] as const;
 const PLAN_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo", "resolve"]);
-const BLUEPRINT_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "ask", "write", "lsp", "task", "todo"]);
+const BLUEPRINT_MODE_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find", "web_search", "write", "lsp", "task", "todo"]);
 
 const stringProperty = (description: string): object => ({ type: "string", description });
 const alwaysEnabled = (): boolean => true;

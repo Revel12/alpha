@@ -32,6 +32,46 @@ export function buildPlanGoalObjective(plan: string, planPath: string, userAppro
   return parts.join("\n");
 }
 
+export function isPlanOpenQuestionsPrompt(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  return /\b(open|unresolved|remaining)\s+questions\b/.test(text)
+    || /\bquestions?\s+(to\s+resolve|remaining|unresolved)\b/.test(text)
+    || /\bwhat\s+(are|were)\s+the\s+(open|unresolved|remaining)\s+questions\b/.test(text);
+}
+
+export function buildPlanOpenQuestionsPrompt(plan: string, planPath: string): string {
+  return [
+    "Review the current Alpha plan and output only unresolved questions that should be answered before implementation.",
+    "Do not modify files. Do not call write, edit, resolve, or implementation tools. If code inspection is needed to avoid asking an obvious question, use read/search/find only.",
+    "If there are no unresolved questions, say that clearly and do not invent questions.",
+    "Include only questions that are actually open in the plan or that materially affect implementation.",
+    "",
+    "Use this Blueprint plan-question format:",
+    "",
+    "> Answer with shorthand like `1a, 2b, 3e` or write freely.",
+    "",
+    "---",
+    "",
+    "**Q1. [Question text]**",
+    "",
+    "_Context: [1-2 line snippet from the plan]_",
+    "",
+    "a) Option A",
+    "b) Option B",
+    "c) Option C",
+    "d) Other (describe)",
+    "",
+    "Leave two blank lines between questions. Leave a blank line between the question text, context line, and options.",
+    "For questions with clear enumerable options, provide lettered choices and always include `Other (describe)`.",
+    "If a question is better answered with free text, omit choices.",
+    "",
+    `Plan path: ${planPath}`,
+    "",
+    "Current plan:",
+    plan.trim(),
+  ].join("\n");
+}
+
 export function updatePlanMode(state: PlanModeState, patch: Partial<PlanModeState>): PlanModeState {
   Object.assign(state, patch, { updatedAt: new Date().toISOString() });
   return state;
@@ -100,7 +140,7 @@ export function renderPlanReview(state: PlanModeState): string {
         ? "Status: approved for implementation."
         : undefined;
   const nextStep = state.pendingApproval || (!state.active && state.approvedPlan)
-    ? "Reply `approve and implement as goal`, `approve and implement`, `refine: <change>`, or `discard plan`."
+    ? "Reply `approve and implement as goal`, `approve and implement`, `refine: <change>`, `what are the open questions?`, or `discard plan`."
     : "Use plan mode to draft a plan, then submit it for approval.";
   const lines = [
     "Alpha plan review",
