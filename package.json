@@ -17,6 +17,7 @@
     "onCommand:alpha.applyPendingEdit",
     "onCommand:alpha.clearPendingEdits",
     "onCommand:alpha.openTerminal",
+    "onCommand:alpha.openTerminalInEditor",
     "onCommand:alpha.inspectVsCodeTools"
   ],
   "main": "./out/extension.js",
@@ -83,6 +84,10 @@
       {
         "command": "alpha.openTerminal",
         "title": "Alpha: Open Terminal"
+      },
+      {
+        "command": "alpha.openTerminalInEditor",
+        "title": "Alpha: Open Terminal in Editor"
       },
       {
         "command": "alpha.inspectVsCodeTools",

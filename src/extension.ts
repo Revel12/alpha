@@ -47,7 +47,8 @@ import { buildInteractiveReviewPrompt } from "./reviewCore";
 import { workspaceRoot } from "./workspace";
 
 let sessions: AlphaSessionManager;
-let alphaTerminal: vscode.Terminal | undefined;
+let alphaPanelTerminal: vscode.Terminal | undefined;
+let alphaEditorTerminal: vscode.Terminal | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   sessions = new AlphaSessionManager(context);
@@ -107,29 +108,8 @@ export function activate(context: vscode.ExtensionContext): void {
       sessions.latest()?.pendingEdits.clear();
       void vscode.window.showInformationMessage("Cleared Alpha pending edits.");
     }),
-    vscode.commands.registerCommand("alpha.openTerminal", async () => {
-      if (alphaTerminal) {
-        alphaTerminal.show();
-        return;
-      }
-      const model = await selectAlphaTerminalModel();
-      if (!model) return;
-      const pty = new AlphaPseudoTerminal(context, model);
-      alphaTerminal = vscode.window.createTerminal({
-        name: "Alpha",
-        iconPath: new vscode.ThemeIcon("hubot"),
-        isTransient: false,
-        pty,
-      });
-      const disposeClose = vscode.window.onDidCloseTerminal((terminal) => {
-        if (terminal === alphaTerminal) {
-          alphaTerminal = undefined;
-          disposeClose.dispose();
-        }
-      });
-      context.subscriptions.push(disposeClose);
-      alphaTerminal.show();
-    }),
+    vscode.commands.registerCommand("alpha.openTerminal", () => openAlphaTerminal(context, "panel")),
+    vscode.commands.registerCommand("alpha.openTerminalInEditor", () => openAlphaTerminal(context, "editor")),
     vscode.commands.registerCommand("alpha.inspectVsCodeTools", () => {
       const output = vscode.window.createOutputChannel("Alpha: VS Code LM Tools");
       output.clear();
@@ -161,6 +141,46 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   sessions.persistNow();
+}
+
+async function openAlphaTerminal(context: vscode.ExtensionContext, location: "panel" | "editor"): Promise<void> {
+  const existing = location === "panel" ? alphaPanelTerminal : alphaEditorTerminal;
+  if (existing) {
+    existing.show();
+    return;
+  }
+
+  const model = await selectAlphaTerminalModel();
+  if (!model) return;
+  const pty = new AlphaPseudoTerminal(context, model);
+  const terminal = vscode.window.createTerminal({
+    name: location === "editor" ? "Alpha Editor" : "Alpha",
+    iconPath: new vscode.ThemeIcon("hubot"),
+    isTransient: false,
+    location: location === "editor"
+      ? { viewColumn: vscode.ViewColumn.Beside }
+      : vscode.TerminalLocation.Panel,
+    pty,
+  });
+
+  if (location === "panel") {
+    alphaPanelTerminal = terminal;
+  } else {
+    alphaEditorTerminal = terminal;
+  }
+
+  const disposeClose = vscode.window.onDidCloseTerminal((closed) => {
+    if (closed === terminal) {
+      if (location === "panel") {
+        alphaPanelTerminal = undefined;
+      } else {
+        alphaEditorTerminal = undefined;
+      }
+      disposeClose.dispose();
+    }
+  });
+  context.subscriptions.push(disposeClose);
+  terminal.show();
 }
 
 class AlphaPseudoTerminal implements vscode.Pseudoterminal {
