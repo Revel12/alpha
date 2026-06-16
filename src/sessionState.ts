@@ -27,6 +27,7 @@ import type {
   PlanModeState,
   BlueprintModeState,
   GoalModeState,
+  AlphaThinkingEffort,
   PermissionDecisionStore,
   TodoItem,
   TodoPhase,
@@ -55,6 +56,7 @@ export interface AlphaSessionState {
   permissionDecisions: PermissionDecisionStore;
   discoveredTools: DiscoveredToolStore;
   terminalTranscript?: AlphaTranscriptEntry[];
+  terminalThinkingEffort?: AlphaThinkingEffort;
   planMode?: PlanModeState;
   blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;
@@ -130,6 +132,31 @@ export class AlphaSessionManager {
     return state;
   }
 
+  forkTerminal(sourceKey: string, label?: string): AlphaSessionState | undefined {
+    const baseKey = terminalBaseKey();
+    if (!isTerminalSessionKey(sourceKey, baseKey)) return undefined;
+    const source = this.byKey.get(sourceKey);
+    if (!source) return undefined;
+
+    const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const key = `${baseKey}:${suffix}`;
+    const now = new Date().toISOString();
+    const persisted = {
+      ...toPersistedSession(source),
+      key,
+      label: cleanSessionLabel(label) || `${source.label} fork`,
+      createdAt: now,
+      updatedAt: now,
+      bashJobs: source.bashJobs.list().filter((job) => job.status !== "running").map(toPersistedBashJob),
+    };
+    const state = createSessionState(key, persisted.label, () => this.persistSoon(), persisted, artifactDirForSession(this.extensionContext, key));
+    state.terminalTranscript = [...(source.terminalTranscript ?? [])];
+    this.byKey.set(key, state);
+    this.touch(state);
+    this.latestKey = state.key;
+    return state;
+  }
+
   terminalSessions(): AlphaSessionState[] {
     const baseKey = terminalBaseKey();
     return [...this.byKey.values()]
@@ -144,6 +171,26 @@ export class AlphaSessionManager {
     if (!state) return undefined;
     state.label = cleanSessionLabel(label) || state.label;
     this.touch(state);
+    return state;
+  }
+
+  deleteTerminal(key: string): AlphaSessionState | undefined {
+    const baseKey = terminalBaseKey();
+    if (!isTerminalSessionKey(key, baseKey)) return undefined;
+    const state = this.byKey.get(key);
+    if (!state) return undefined;
+    state.pendingEdits.clear();
+    state.snapshots.clear();
+    state.artifacts.clear();
+    state.bashJobs.clear();
+    state.conflicts.clear();
+    state.permissionDecisions.clear();
+    state.discoveredTools.clear();
+    this.byKey.delete(key);
+    if (this.latestKey === key) {
+      this.latestKey = this.terminalSessions()[0]?.key ?? this.list()[0]?.key;
+    }
+    this.persistSoon();
     return state;
   }
 
@@ -332,6 +379,7 @@ function createSessionState(
     permissionDecisions: new InMemoryPermissionDecisionStore(),
     discoveredTools: new InMemoryDiscoveredToolStore(persisted?.discoveredTools ?? [], notifyChanged),
     terminalTranscript: persisted?.terminalTranscript,
+    terminalThinkingEffort: persisted?.terminalThinkingEffort,
     planMode: persisted?.planMode,
     blueprintMode: persisted?.blueprintMode,
     goalMode: persisted?.goalMode,
@@ -354,6 +402,7 @@ function toPersistedSession(state: AlphaSessionState): PersistedSession {
     bashJobs: state.bashJobs.list().map(toPersistedBashJob),
     discoveredTools: state.discoveredTools.list(),
     terminalTranscript: state.terminalTranscript,
+    terminalThinkingEffort: state.terminalThinkingEffort,
     planMode: state.planMode,
     blueprintMode: state.blueprintMode,
     goalMode: state.goalMode,
@@ -434,6 +483,7 @@ interface PersistedSession {
   bashJobs?: BashJob[];
   discoveredTools?: string[];
   terminalTranscript?: AlphaTranscriptEntry[];
+  terminalThinkingEffort?: AlphaThinkingEffort;
   planMode?: PlanModeState;
   blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;

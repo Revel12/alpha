@@ -4,6 +4,8 @@ import type { AlphaTranscriptEntry } from "./transcript";
 
 export type { ConflictStore } from "./conflictCore";
 
+export type AlphaThinkingEffort = "low" | "medium" | "high";
+
 export interface AlphaContext {
   extensionContext: vscode.ExtensionContext;
   sessionKey: string;
@@ -26,6 +28,7 @@ export interface AlphaContext {
   planMode?: PlanModeState;
   blueprintMode?: BlueprintModeState;
   goalMode?: GoalModeState;
+  thinkingEffort?: AlphaThinkingEffort;
   taskDepth?: number;
   taskAllowedSpawns?: string[] | "*" | "";
   taskBlockedAgent?: string;

@@ -45,6 +45,8 @@ import {
 } from "./planMode";
 import { buildInteractiveReviewPrompt } from "./reviewCore";
 import { workspaceRoot } from "./workspace";
+import type { AlphaThinkingEffort } from "./types";
+import { bashTool } from "./tools/bash";
 
 let sessions: AlphaSessionManager;
 let alphaPanelTerminal: vscode.Terminal | undefined;
@@ -183,6 +185,19 @@ async function openAlphaTerminal(context: vscode.ExtensionContext, location: "pa
   terminal.show();
 }
 
+interface ModelPickerState {
+  models: vscode.LanguageModelChat[];
+  selected: number;
+  renderedLines: number;
+}
+
+interface SessionPickerState {
+  sessions: AlphaSessionState[];
+  selected: number;
+  renderedLines: number;
+  confirmingDelete?: boolean;
+}
+
 class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<void>();
@@ -195,10 +210,14 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   private busy = false;
   private cancellation: vscode.CancellationTokenSource | undefined;
   private sessionKey: string | undefined;
+  private modelPicker: ModelPickerState | undefined;
+  private sessionPicker: SessionPickerState | undefined;
+  private keyDebug = false;
+  private lastContextStatus = "ctx ?";
 
   constructor(
     private readonly extensionContext: vscode.ExtensionContext,
-    private readonly model: vscode.LanguageModelChat,
+    private model: vscode.LanguageModelChat,
   ) {}
 
   open(): void {
@@ -206,7 +225,10 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     this.writeLine(`Alpha terminal 0.0.1`);
     this.writeLine(`Model: ${this.model.name}`);
     this.writeLine(`Session: ${session.label}`);
-    this.writeLine("Type `help`, `/sessions`, `/new`, `/resume`, `/context`, `/plan <goal>`, `/goal`, `/compact`, `/review`, or a natural request.");
+    this.writeLine(`Effort: ${this.currentEffort()}`);
+    this.writeLine("Type `help`, `/new`, `/fork`, `/resume`, `/context`, `/plan <goal>`, `/goal`, `/compact`, `/review`, or a natural request.");
+    this.writeLine("Prefix shell commands with `!`, for example `!npm test`.");
+    this.writeLine("Shift+Tab cycles thinking effort.");
     this.writeLine("Type `exit` to close this terminal.");
     this.writeLine("");
     this.prompt();
@@ -218,6 +240,25 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   }
 
   handleInput(data: string): void {
+    if (this.keyDebug) {
+      this.writeLine(formatKeyDebugInput(data));
+      return;
+    }
+
+    if (this.modelPicker) {
+      this.handleModelPickerInput(data);
+      return;
+    }
+    if (this.sessionPicker) {
+      this.handleSessionPickerInput(data);
+      return;
+    }
+
+    if (data === "\x1b[Z") {
+      this.cycleEffort();
+      return;
+    }
+
     if (data === "\x03") {
       this.cancelCurrentRequest();
       return;
@@ -274,8 +315,25 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
       this.prompt();
       return;
     }
+    if (promptInput === "/keydebug") {
+      this.keyDebug = true;
+      this.writeLine("Key debug enabled. Press keys/paste text to inspect raw input. Reload/close terminal to exit debug mode.");
+      this.prompt();
+      return;
+    }
+    if (await this.handleModelCommand(promptInput)) {
+      return;
+    }
+    if (this.handleEffortCommand(promptInput)) {
+      this.prompt();
+      return;
+    }
     if (await this.handleSessionCommand(promptInput)) {
       this.prompt();
+      return;
+    }
+    if (promptInput.startsWith("!")) {
+      await this.runShellPassthrough(promptInput.slice(1).trim());
       return;
     }
 
@@ -285,10 +343,45 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     const session = this.currentSession();
     try {
       await handleAlphaTerminalRequest(this.extensionContext, session, promptInput, this.model, stream.asChatResponseStream(), this.cancellation.token);
+      this.updateContextStatusFromOutput(stream.markdownText);
       rememberTerminalTurn(session, promptInput, stream.markdownText);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.writeMarkdown(`Alpha terminal error: ${message}`);
+    } finally {
+      this.cancellation.dispose();
+      this.cancellation = undefined;
+      this.busy = false;
+      this.writeLine("");
+      this.prompt();
+    }
+  }
+
+  private async runShellPassthrough(command: string): Promise<void> {
+    if (!command) {
+      this.writeLine("Usage: !<command>");
+      this.prompt();
+      return;
+    }
+
+    this.busy = true;
+    this.cancellation = new vscode.CancellationTokenSource();
+    const stream = new TerminalResponseStream((text) => this.writeMarkdown(text));
+    const session = this.currentSession();
+    try {
+      const transcript = buildTerminalTranscript(session);
+      const request = terminalChatRequest(`!${command}`, this.model);
+      const chatContext = terminalChatContext(transcript);
+      const ctx = createAlphaContext(this.extensionContext, session, request, chatContext, transcript, stream.asChatResponseStream(), this.cancellation.token);
+      const result = await bashTool.run(command, ctx);
+      stream.markdown(result.markdown);
+      this.updateContextStatusFromOutput(stream.markdownText);
+      rememberTerminalTurn(session, `!${command}`, stream.markdownText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const rendered = `Alpha bash error: ${message}`;
+      this.writeMarkdown(rendered);
+      rememberTerminalTurn(session, `!${command}`, rendered);
     } finally {
       this.cancellation.dispose();
       this.cancellation = undefined;
@@ -351,8 +444,96 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     }
   }
 
+  private async handleModelCommand(input: string): Promise<boolean> {
+    const match = /^\/model\b(?:\s+([\s\S]*))?$/i.exec(input);
+    if (!match) return false;
+    const arg = (match[1] ?? "").trim();
+    const models = await listAlphaTerminalModels();
+    if (!models.length) {
+      this.writeLine("No Copilot chat models are available to Alpha.");
+      this.prompt();
+      return true;
+    }
+
+    if (arg) {
+      const selected = resolveModelArgument(models, arg);
+      if (!selected) {
+        this.writeLine(`No model matched: ${arg}`);
+        this.writeModelList(models);
+        this.prompt();
+        return true;
+      }
+      this.model = selected;
+      this.writeLine(`Selected model: ${modelDisplayName(this.model)}`);
+      this.prompt();
+      return true;
+    }
+
+    const selected = Math.max(0, models.findIndex((model) => model.id === this.model.id));
+    this.modelPicker = { models, selected, renderedLines: 0 };
+    this.renderModelPicker();
+    return true;
+  }
+
+  private handleModelPickerInput(data: string): void {
+    const picker = this.modelPicker;
+    if (!picker) return;
+
+    if (data === "\x1b[A") {
+      picker.selected = Math.max(0, picker.selected - 1);
+      this.renderModelPicker();
+      return;
+    }
+    if (data === "\x1b[B") {
+      picker.selected = Math.min(picker.models.length - 1, picker.selected + 1);
+      this.renderModelPicker();
+      return;
+    }
+    if (data === "\r") {
+      this.model = picker.models[picker.selected] ?? this.model;
+      this.modelPicker = undefined;
+      this.writeLine(`Selected model: ${modelDisplayName(this.model)}`);
+      this.prompt();
+      return;
+    }
+    if (data === "\x1b" || data === "\x03") {
+      this.modelPicker = undefined;
+      this.writeLine("Model selection cancelled.");
+      this.prompt();
+    }
+  }
+
+  private renderModelPicker(): void {
+    const picker = this.modelPicker;
+    if (!picker) return;
+    const lines = [
+      "Select model (Up/Down, Enter to select, Esc to cancel):",
+      "",
+      ...picker.models.map((model, index) => {
+        const marker = index === picker.selected ? ">" : " ";
+        const current = model.id === this.model.id ? " (current)" : "";
+        return `${marker} ${index + 1}. ${modelDisplayName(model)}${current}`;
+      }),
+    ];
+
+    if (picker.renderedLines > 0) {
+      this.write(`\x1b[${picker.renderedLines}F\x1b[J`);
+    }
+    this.write(lines.join("\r\n"));
+    this.write("\r\n");
+    picker.renderedLines = lines.length;
+  }
+
+  private writeModelList(models: vscode.LanguageModelChat[]): void {
+    this.writeLine("Available models:");
+    models.forEach((model, index) => {
+      const current = model.id === this.model.id ? " (current)" : "";
+      this.writeLine(`${index + 1}. ${modelDisplayName(model)}${current}`);
+    });
+  }
+
   private async handleSessionCommand(input: string): Promise<boolean> {
-    const match = /^\/(new|sessions|session|resume|rename|clear-session)\b(?:\s+([\s\S]*))?$/i.exec(input);
+    const match = /^\/(new|fork|resume|rename|clear-session)\b(?:\s+([\s\S]*))?$/i.exec(input);
     if (!match) return false;
 
     const command = match[1].toLowerCase();
@@ -365,19 +546,29 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
       return true;
     }
 
-    if (command === "sessions" || command === "session") {
-      this.renderSessions();
+    if (command === "fork") {
+      const session = sessions.forkTerminal(this.currentSession().key, arg || undefined);
+      if (!session) {
+        this.writeLine("Could not fork the current Alpha terminal session.");
+        return true;
+      }
+      this.switchSession(session);
+      this.writeLine(`Forked Alpha terminal session: ${session.label}`);
       return true;
     }
 
     if (command === "resume") {
-      const session = arg ? this.resolveSessionArgument(arg) : await this.pickSession();
+      const session = arg ? this.resolveSessionArgument(arg) : undefined;
+      if (!arg) {
+        this.openSessionPicker();
+        return true;
+      }
       if (!session) {
         this.writeLine("No Alpha terminal session selected.");
         return true;
       }
       this.switchSession(session);
-      this.writeLine(`Resumed Alpha terminal session: ${session.label}`);
+      this.writeLine(`Resumed Alpha terminal session: ${session.label} (effort: ${this.currentEffort()})`);
       return true;
     }
 
@@ -415,27 +606,44 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   private currentSession(): AlphaSessionState {
     const session = sessions.getTerminal(this.sessionKey);
     this.sessionKey = session.key;
+    session.terminalThinkingEffort ??= "medium";
     return session;
   }
 
   private switchSession(session: AlphaSessionState): void {
     this.sessionKey = session.key;
+    session.terminalThinkingEffort ??= "medium";
   }
 
-  private renderSessions(): void {
-    const terminalSessions = sessions.terminalSessions();
-    if (!terminalSessions.length) {
-      this.writeLine("No Alpha terminal sessions.");
-      return;
+  private handleEffortCommand(input: string): boolean {
+    const match = /^\/effort\b(?:\s+(low|medium|high))?\s*$/i.exec(input);
+    if (!match) return false;
+    const requested = match[1]?.toLowerCase() as AlphaThinkingEffort | undefined;
+    if (requested) {
+      this.setEffort(requested);
+    } else {
+      this.writeLine(`Effort: ${this.currentEffort()} (Shift+Tab cycles low -> medium -> high)`);
     }
-    const activeKey = this.currentSession().key;
-    this.writeLine("Alpha terminal sessions:");
-    terminalSessions.forEach((session, index) => {
-      const marker = session.key === activeKey ? "*" : " ";
-      const turns = Math.ceil((session.terminalTranscript?.length ?? 0) / 2);
-      this.writeLine(`${marker} ${index + 1}. ${session.label} (${turns} turn${turns === 1 ? "" : "s"}, ${formatTerminalDate(session.updatedAt)})`);
-    });
-    this.writeLine("Use `/resume <number>` to switch sessions, or `/new <name>` to start another.");
+    return true;
+  }
+
+  private cycleEffort(): void {
+    const current = this.currentEffort();
+    const next: AlphaThinkingEffort = current === "low" ? "medium" : current === "medium" ? "high" : "low";
+    this.setEffort(next);
+    this.writeLine("");
+    this.prompt();
+  }
+
+  private setEffort(effort: AlphaThinkingEffort): void {
+    const session = this.currentSession();
+    session.terminalThinkingEffort = effort;
+    sessions.persistNow();
+    this.writeLine(`Effort: ${effort}`);
+  }
+
+  private currentEffort(): AlphaThinkingEffort {
+    return this.currentSession().terminalThinkingEffort ?? "medium";
   }
 
   private resolveSessionArgument(arg: string): AlphaSessionState | undefined {
@@ -446,23 +654,141 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     return sessions.terminalSessions().find((session) => session.label.toLowerCase().includes(lower));
   }
 
-  private async pickSession(): Promise<AlphaSessionState | undefined> {
+  private openSessionPicker(): void {
     const terminalSessions = sessions.terminalSessions();
-    if (!terminalSessions.length) return undefined;
-    const picked = await vscode.window.showQuickPick(
-      terminalSessions.map((session, index) => ({
-        label: `${index + 1}. ${session.label}`,
-        description: formatTerminalDate(session.updatedAt),
-        detail: `${Math.ceil((session.terminalTranscript?.length ?? 0) / 2)} turn(s)`,
-        session,
-      })),
-      { title: "Resume Alpha Terminal Session", placeHolder: "Choose a session", ignoreFocusOut: true },
-    );
-    return picked?.session;
+    if (!terminalSessions.length) {
+      this.writeLine("No Alpha terminal sessions.");
+      this.prompt();
+      return;
+    }
+    const currentKey = this.currentSession().key;
+    const selected = Math.max(0, terminalSessions.findIndex((session) => session.key === currentKey));
+    this.sessionPicker = { sessions: terminalSessions, selected, renderedLines: 0 };
+    this.renderSessionPicker();
+  }
+
+  private handleSessionPickerInput(data: string): void {
+    const picker = this.sessionPicker;
+    if (!picker) return;
+
+    if (picker.confirmingDelete) {
+      if (data === "\r") {
+        this.deleteSelectedSession();
+        return;
+      }
+      if (data === "\x1b" || data === "\x03") {
+        picker.confirmingDelete = false;
+        this.renderSessionPicker();
+      }
+      return;
+    }
+
+    if (data === "\x1b[A") {
+      picker.selected = Math.max(0, picker.selected - 1);
+      this.renderSessionPicker();
+      return;
+    }
+    if (data === "\x1b[B") {
+      picker.selected = Math.min(picker.sessions.length - 1, picker.selected + 1);
+      this.renderSessionPicker();
+      return;
+    }
+    if (data === "\r") {
+      const selected = picker.sessions[picker.selected];
+      this.sessionPicker = undefined;
+      if (selected) {
+        this.switchSession(selected);
+        this.writeLine(`Resumed Alpha terminal session: ${selected.label} (effort: ${this.currentEffort()})`);
+      }
+      this.prompt();
+      return;
+    }
+    if (data === "\x04" || data.toLowerCase() === "d") {
+      picker.confirmingDelete = true;
+      this.renderSessionPicker();
+      return;
+    }
+    if (data === "\x1b" || data === "\x03") {
+      this.sessionPicker = undefined;
+      this.writeLine("Session selection cancelled.");
+      this.prompt();
+    }
+  }
+
+  private renderSessionPicker(): void {
+    const picker = this.sessionPicker;
+    if (!picker) return;
+    const activeKey = this.currentSession().key;
+    const selectedSession = picker.sessions[picker.selected];
+    const lines = [
+      picker.confirmingDelete
+        ? `Delete session "${selectedSession?.label ?? ""}"? Enter confirms, Esc cancels.`
+        : "Resume session (Up/Down, Enter to resume, Ctrl+D or d to delete, Esc to cancel):",
+      "",
+      ...picker.sessions.map((session, index) => {
+        const marker = index === picker.selected ? ">" : " ";
+        const active = session.key === activeKey ? " (active)" : "";
+        const turns = Math.ceil((session.terminalTranscript?.length ?? 0) / 2);
+        return `${marker} ${index + 1}. ${session.label}${active} - ${turns} turn${turns === 1 ? "" : "s"} - ${formatTerminalDate(session.updatedAt)}`;
+      }),
+    ];
+
+    if (picker.renderedLines > 0) {
+      this.write(`\x1b[${picker.renderedLines}F\x1b[J`);
+    }
+    this.write(lines.join("\r\n"));
+    this.write("\r\n");
+    picker.renderedLines = lines.length;
+  }
+
+  private deleteSelectedSession(): void {
+    const picker = this.sessionPicker;
+    if (!picker) return;
+    const selected = picker.sessions[picker.selected];
+    if (!selected) return;
+
+    const deleted = sessions.deleteTerminal(selected.key);
+    if (!deleted) {
+      picker.confirmingDelete = false;
+      this.writeLine("Could not delete selected session.");
+      this.renderSessionPicker();
+      return;
+    }
+
+    const nextSessions = sessions.terminalSessions();
+    if (!nextSessions.length) {
+      const created = sessions.createTerminal();
+      this.switchSession(created);
+      this.sessionPicker = undefined;
+      this.writeLine(`Deleted session "${selected.label}". Started new session: ${created.label}`);
+      this.prompt();
+      return;
+    }
+
+    if (selected.key === this.sessionKey) {
+      this.switchSession(nextSessions[0]);
+    }
+
+    picker.sessions = nextSessions;
+    picker.selected = Math.min(picker.selected, picker.sessions.length - 1);
+    picker.confirmingDelete = false;
+    this.renderSessionPicker();
   }
 
   private prompt(): void {
-    this.write("alpha> ");
+    this.write(`${this.promptLabel()}> `);
+  }
+
+  private promptLabel(): string {
+    const model = shortModelName(this.model);
+    const session = shortSessionLabel(this.currentSession().label);
+    return `alpha[${model} | ${this.currentEffort()} | ${this.lastContextStatus} | ${session}]`;
+  }
+
+  private updateContextStatusFromOutput(output: string): void {
+    const match = output.match(/Alpha context usage:\s*([\s\S]*?)\n/);
+    if (!match) return;
+    this.lastContextStatus = compactContextUsage(match[1].trim());
   }
 
   private writeMarkdown(text: string): void {
@@ -503,14 +829,7 @@ class TerminalResponseStream {
 }
 
 async function selectAlphaTerminalModel(): Promise<vscode.LanguageModelChat | undefined> {
-  let models: vscode.LanguageModelChat[];
-  try {
-    models = await vscode.lm.selectChatModels({ vendor: "copilot" });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(`Alpha could not access Copilot models: ${message}`);
-    return undefined;
-  }
+  const models = await listAlphaTerminalModels();
 
   if (!models.length) {
     void vscode.window.showErrorMessage("Alpha did not find any Copilot chat models. Check Copilot sign-in, policy, and Language Model API access.");
@@ -519,6 +838,36 @@ async function selectAlphaTerminalModel(): Promise<vscode.LanguageModelChat | un
 
   const preferred = models.find((model) => /gpt-4\.1|gpt-4o|claude.*sonnet/i.test(`${model.family} ${model.name}`));
   return preferred ?? models[0];
+}
+
+async function listAlphaTerminalModels(): Promise<vscode.LanguageModelChat[]> {
+  try {
+    return await vscode.lm.selectChatModels({ vendor: "copilot" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Alpha could not access Copilot models: ${message}`);
+    return [];
+  }
+}
+
+function resolveModelArgument(models: vscode.LanguageModelChat[], arg: string): vscode.LanguageModelChat | undefined {
+  const ordinal = Number(arg);
+  if (Number.isInteger(ordinal) && ordinal >= 1 && ordinal <= models.length) {
+    return models[ordinal - 1];
+  }
+
+  const needle = arg.toLowerCase();
+  return models.find((model) => modelTextForSearch(model).includes(needle));
+}
+
+function modelDisplayName(model: vscode.LanguageModelChat): string {
+  const meta = [model.family, model.version].filter(Boolean).join(" ");
+  const tokens = model.maxInputTokens ? `, ${model.maxInputTokens.toLocaleString()} tokens` : "";
+  return `${model.name}${meta ? ` [${meta}${tokens}]` : tokens ? ` [${tokens.slice(2)}]` : ""}`;
+}
+
+function modelTextForSearch(model: vscode.LanguageModelChat): string {
+  return `${model.name} ${model.family} ${model.version} ${model.id}`.toLowerCase();
 }
 
 async function handleAlphaTerminalRequest(
@@ -611,6 +960,44 @@ function formatTerminalDate(value: string): string {
   return date.toLocaleString();
 }
 
+function shortModelName(model: vscode.LanguageModelChat): string {
+  const text = (model.name || model.family || model.id).replace(/\s+/g, " ").trim();
+  return truncateMiddle(text || "model", 18);
+}
+
+function shortSessionLabel(label: string): string {
+  return truncateMiddle(label.replace(/\s+/g, " ").trim() || "session", 18);
+}
+
+function compactContextUsage(value: string): string {
+  const percent = value.match(/\((\d+(?:\.\d+)?)%\)/)?.[1];
+  if (percent) return `${percent}% ctx`;
+  const tokenPair = value.match(/([\d,]+)\s*\/\s*([\d,]+)/);
+  if (tokenPair) return `${tokenPair[1]}/${tokenPair[2]} ctx`;
+  return truncateMiddle(value, 18);
+}
+
+function truncateMiddle(value: string, max: number): string {
+  if (value.length <= max) return value;
+  if (max <= 3) return value.slice(0, max);
+  const left = Math.ceil((max - 3) / 2);
+  const right = Math.floor((max - 3) / 2);
+  return `${value.slice(0, left)}...${value.slice(value.length - right)}`;
+}
+
+function formatKeyDebugInput(data: string): string {
+  const codes = [...data].map((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    return `${JSON.stringify(char)} U+${code.toString(16).toUpperCase().padStart(4, "0")}`;
+  });
+  const escaped = data
+    .replace(/\x1b/g, "\\x1b")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t");
+  return `keydebug: ${JSON.stringify(escaped)} :: ${codes.join(" ")}`;
+}
+
 async function handleAlphaRequest(
   extensionContext: vscode.ExtensionContext,
   request: vscode.ChatRequest,
@@ -637,42 +1024,7 @@ async function handleAlphaParsedRequest(
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<void> {
-  const alphaContext: AlphaContext = {
-    extensionContext,
-    sessionKey: session.key,
-    sessionLabel: session.label,
-    compactionSummary: session.compactionSummary,
-    compactedThroughHistoryIndex: session.compactedThroughHistoryIndex,
-    request,
-    chatContext,
-    transcript,
-    stream,
-    token,
-    pendingEdits: session.pendingEdits,
-    todos: session.todos,
-    snapshots: session.snapshots,
-    artifacts: session.artifacts,
-    bashJobs: session.bashJobs,
-    conflicts: session.conflicts,
-    permissionDecisions: session.permissionDecisions,
-    discoveredTools: session.discoveredTools,
-    planMode: session.planMode,
-    blueprintMode: session.blueprintMode,
-    goalMode: session.goalMode,
-    persistSession: () => sessions.persistNow(),
-    setCompaction: (summary, compactedThroughHistoryIndex) => {
-      session.compactionSummary = summary;
-      session.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
-      alphaContext.compactionSummary = summary;
-      alphaContext.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
-      sessions.persistNow();
-    },
-    setGoalMode: (state) => {
-      session.goalMode = state;
-      alphaContext.goalMode = state;
-      sessions.persistNow();
-    },
-  };
+  const alphaContext = createAlphaContext(extensionContext, session, request, chatContext, transcript, stream, token);
 
   try {
     if (!parsedRequest.command && (!parsedRequest.prompt || parsedRequest.prompt === "help")) {
@@ -757,6 +1109,55 @@ async function handleAlphaParsedRequest(
     const message = error instanceof Error ? error.message : String(error);
     stream.markdown(`Alpha error: ${message}`);
   }
+}
+
+function createAlphaContext(
+  extensionContext: vscode.ExtensionContext,
+  session: AlphaSessionState,
+  request: vscode.ChatRequest,
+  chatContext: vscode.ChatContext,
+  transcript: AlphaTranscriptEntry[],
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): AlphaContext {
+  const alphaContext: AlphaContext = {
+    extensionContext,
+    sessionKey: session.key,
+    sessionLabel: session.label,
+    compactionSummary: session.compactionSummary,
+    compactedThroughHistoryIndex: session.compactedThroughHistoryIndex,
+    request,
+    chatContext,
+    transcript,
+    stream,
+    token,
+    pendingEdits: session.pendingEdits,
+    todos: session.todos,
+    snapshots: session.snapshots,
+    artifacts: session.artifacts,
+    bashJobs: session.bashJobs,
+    conflicts: session.conflicts,
+    permissionDecisions: session.permissionDecisions,
+    discoveredTools: session.discoveredTools,
+    planMode: session.planMode,
+    blueprintMode: session.blueprintMode,
+    goalMode: session.goalMode,
+    thinkingEffort: session.terminalThinkingEffort,
+    persistSession: () => sessions.persistNow(),
+    setCompaction: (summary, compactedThroughHistoryIndex) => {
+      session.compactionSummary = summary;
+      session.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
+      alphaContext.compactionSummary = summary;
+      alphaContext.compactedThroughHistoryIndex = compactedThroughHistoryIndex;
+      sessions.persistNow();
+    },
+    setGoalMode: (state) => {
+      session.goalMode = state;
+      alphaContext.goalMode = state;
+      sessions.persistNow();
+    },
+  };
+  return alphaContext;
 }
 
 async function handleGoalCommand(

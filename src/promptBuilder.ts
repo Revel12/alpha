@@ -22,6 +22,16 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
   const blueprintLines = ctx ? blueprintModeSystemPrompt(ctx) : undefined;
   const planLines = ctx ? planModeSystemPrompt(ctx) : undefined;
   const goalLines = ctx ? goalModeSystemPrompt(ctx.goalMode) : undefined;
+  const effortLines = ctx?.thinkingEffort
+    ? [
+        "# Thinking Effort",
+        `- current effort: ${ctx.thinkingEffort}`,
+        "- This is an Alpha-side terminal effort hint. Match analysis depth, tool use, and verification to this setting.",
+        ctx.thinkingEffort === "low" ? "- Low: answer directly, use minimal exploration, and avoid optional verification unless correctness requires it." : undefined,
+        ctx.thinkingEffort === "medium" ? "- Medium: balance speed and rigor with normal tool use and focused verification." : undefined,
+        ctx.thinkingEffort === "high" ? "- High: reason carefully, inspect relevant context, and verify non-trivial claims or changes more thoroughly." : undefined,
+      ].filter((line): line is string => typeof line === "string").join("\n")
+    : undefined;
   const approvedPlanLines = ctx?.planMode?.approvedPlan && !ctx.planMode.active
     ? [
         "# Approved Plan",
@@ -39,6 +49,7 @@ export function buildAlphaSystemPrompt(ctx?: AlphaContext, selection: AlphaToolS
     "",
     ...sessionLines,
     ...(goalLines ? [goalLines, ""] : []),
+    ...(effortLines ? [effortLines, ""] : []),
     ...(blueprintLines ? [blueprintLines, ""] : []),
     ...(planLines ? [planLines, ""] : []),
     ...(approvedPlanLines ? [approvedPlanLines, ""] : []),
