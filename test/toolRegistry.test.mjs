@@ -1676,6 +1676,10 @@ test("blueprint generate prompt hands the refined request to plan mode", () => {
   assert.match(prompt, /Write the plan to the active Alpha plan file/);
   assert.match(prompt, /Prefer the existing artifact store/);
   assert.equal(isBlueprintGeneratePrompt("ready to generate the plan"), true);
+  assert.equal(isBlueprintGeneratePrompt("/blueprint-generate"), true);
+  assert.equal(isBlueprintGeneratePrompt("1a, 2b, 3e, 4a, 5b"), false);
+  assert.equal(isBlueprintGeneratePrompt("1a, keep the implementation plan focused on the existing workflow"), false);
+  assert.equal(isBlueprintGeneratePrompt("Generate cache keys as part of the plan, but keep asking questions"), false);
 });
 
 test("blueprint mode blocks workspace writes and allows local notes", () => {

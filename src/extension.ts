@@ -716,11 +716,6 @@ async function handleAlphaParsedRequest(
       return;
     }
 
-    if (!parsedRequest.command && session.planMode && (session.planMode.pendingApproval || session.planMode.approvedPlan)) {
-      const handled = await handlePlanDecisionPrompt(parsedRequest.prompt, session, alphaContext);
-      if (handled) return;
-    }
-
     if (!parsedRequest.command && session.blueprintMode?.active) {
       if (isBlueprintGeneratePrompt(parsedRequest.prompt)) {
         await generatePlanFromBlueprint(parsedRequest.prompt, session, alphaContext);
@@ -728,6 +723,11 @@ async function handleAlphaParsedRequest(
         await continueBlueprint(parsedRequest.prompt, session, alphaContext);
       }
       return;
+    }
+
+    if (!parsedRequest.command && session.planMode && (session.planMode.pendingApproval || session.planMode.approvedPlan)) {
+      const handled = await handlePlanDecisionPrompt(parsedRequest.prompt, session, alphaContext);
+      if (handled) return;
     }
 
     const expandedPrompt = await expandAlphaCommand(parsedRequest);
@@ -945,7 +945,7 @@ function buildBlueprintStartPrompt(state: NonNullable<AlphaSessionState["bluepri
     "Start Alpha Blueprint mode for this request.",
     `Selected template: ${state.template}${state.customTemplatePrompt ? ` (${state.customTemplatePrompt})` : ""}.`,
     "Investigate enough to ask useful questions. Use read-only explore subagents with task fanout when the work is broad.",
-    "Ask the first 3-5 clarifying questions unless the request is already fully specified.",
+    "Ask the first 3-5 clarifying questions. Do not skip the question round on your own.",
     "Questions must match the selected template's level and perspective. For concise templates, avoid deep implementation-detail questions unless necessary.",
     "Users generally expect to continue existing patterns and expand their system; only question existing patterns when the requested change clearly conflicts with them.",
     "Focus on decisions that meaningfully affect implementation, not trivial or obvious choices.",

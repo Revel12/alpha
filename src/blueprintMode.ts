@@ -167,8 +167,12 @@ export function buildBlueprintGeneratePrompt(state: BlueprintModeState): string 
 }
 
 export function isBlueprintGeneratePrompt(prompt: string): boolean {
-  return /\b(generate|create|write|make)\b.*\b(plan|blueprint)\b/i.test(prompt)
-    || /\b(done|ready)\b.*\b(plan|generate)\b/i.test(prompt);
+  const text = prompt.trim().toLowerCase();
+  if (!text) return false;
+  if (text.includes("\n")) return false;
+  if (text.length > 120) return false;
+  if (/(?:^|[\s,;])\d+[a-z](?:\b|[\s,;.)-])/.test(text)) return false;
+  return /^(?:\/?blueprint-generate|generate(?:\s+the)?\s+(?:alpha\s+)?(?:plan|blueprint)|create(?:\s+the)?\s+(?:alpha\s+)?(?:plan|blueprint)|write(?:\s+the)?\s+(?:alpha\s+)?(?:plan|blueprint)|make(?:\s+the)?\s+(?:alpha\s+)?(?:plan|blueprint)|(?:done|ready)(?:\s+(?:with|planning|for|to))*\s+(?:generate\s+)?(?:the\s+)?(?:alpha\s+)?(?:plan|blueprint))[\s.!?]*$/i.test(text);
 }
 
 export function parseBlueprintTemplate(input: string): BlueprintTemplate | undefined {
