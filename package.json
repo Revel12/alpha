@@ -18,6 +18,7 @@
     "onCommand:alpha.clearPendingEdits",
     "onCommand:alpha.openTerminal",
     "onCommand:alpha.openTerminalInEditor",
+    "onCommand:alpha.insertTerminalNewline",
     "onCommand:alpha.inspectVsCodeTools"
   ],
   "main": "./out/extension.js",
@@ -90,8 +91,19 @@
         "title": "Alpha: Open Terminal in Editor"
       },
       {
+        "command": "alpha.insertTerminalNewline",
+        "title": "Alpha: Insert Terminal Newline"
+      },
+      {
         "command": "alpha.inspectVsCodeTools",
         "title": "Alpha: Inspect VS Code LM Tools"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "alpha.insertTerminalNewline",
+        "key": "shift+enter",
+        "when": "terminalFocus && alpha.terminalFocus"
       }
     ],
     "configuration": {

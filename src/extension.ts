@@ -51,6 +51,8 @@ import { bashTool } from "./tools/bash";
 let sessions: AlphaSessionManager;
 let alphaPanelTerminal: vscode.Terminal | undefined;
 let alphaEditorTerminal: vscode.Terminal | undefined;
+let alphaPanelPty: AlphaPseudoTerminal | undefined;
+let alphaEditorPty: AlphaPseudoTerminal | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   sessions = new AlphaSessionManager(context);
@@ -112,6 +114,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("alpha.openTerminal", () => openAlphaTerminal(context, "panel")),
     vscode.commands.registerCommand("alpha.openTerminalInEditor", () => openAlphaTerminal(context, "editor")),
+    vscode.commands.registerCommand("alpha.insertTerminalNewline", () => {
+      const pty = activeAlphaPseudoTerminal();
+      if (!pty) return;
+      pty.insertNewlineFromKeybinding();
+    }),
+    vscode.window.onDidChangeActiveTerminal(() => updateAlphaTerminalFocusContext()),
     vscode.commands.registerCommand("alpha.inspectVsCodeTools", () => {
       const output = vscode.window.createOutputChannel("Alpha: VS Code LM Tools");
       output.clear();
@@ -167,22 +175,41 @@ async function openAlphaTerminal(context: vscode.ExtensionContext, location: "pa
 
   if (location === "panel") {
     alphaPanelTerminal = terminal;
+    alphaPanelPty = pty;
   } else {
     alphaEditorTerminal = terminal;
+    alphaEditorPty = pty;
   }
 
   const disposeClose = vscode.window.onDidCloseTerminal((closed) => {
     if (closed === terminal) {
       if (location === "panel") {
         alphaPanelTerminal = undefined;
+        alphaPanelPty = undefined;
       } else {
         alphaEditorTerminal = undefined;
+        alphaEditorPty = undefined;
       }
+      updateAlphaTerminalFocusContext();
       disposeClose.dispose();
     }
   });
   context.subscriptions.push(disposeClose);
   terminal.show();
+  updateAlphaTerminalFocusContext();
+}
+
+function activeAlphaPseudoTerminal(): AlphaPseudoTerminal | undefined {
+  const active = vscode.window.activeTerminal;
+  if (active === alphaPanelTerminal) return alphaPanelPty;
+  if (active === alphaEditorTerminal) return alphaEditorPty;
+  return undefined;
+}
+
+function updateAlphaTerminalFocusContext(): void {
+  const active = vscode.window.activeTerminal;
+  const isAlphaTerminal = active === alphaPanelTerminal || active === alphaEditorTerminal;
+  void vscode.commands.executeCommand("setContext", "alpha.terminalFocus", isAlphaTerminal);
 }
 
 interface ModelPickerState {
@@ -214,6 +241,7 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   private sessionPicker: SessionPickerState | undefined;
   private keyDebug = false;
   private lastContextStatus = "ctx ?";
+  private bracketedPasteBuffer: string | undefined;
 
   constructor(
     private readonly extensionContext: vscode.ExtensionContext,
@@ -221,6 +249,7 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   ) {}
 
   open(): void {
+    this.write("\x1b[?2004h");
     const session = this.currentSession();
     this.writeLine(`Alpha terminal 0.0.1`);
     this.writeLine(`Model: ${this.model.name}`);
@@ -235,8 +264,14 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   }
 
   close(): void {
+    this.write("\x1b[?2004l");
     this.cancellation?.cancel();
     this.cancellation?.dispose();
+  }
+
+  insertNewlineFromKeybinding(): void {
+    if (this.busy || this.modelPicker || this.sessionPicker || this.keyDebug) return;
+    this.appendInputText("\n");
   }
 
   handleInput(data: string): void {
@@ -271,6 +306,12 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     }
     if (this.busy) return;
 
+    this.handlePromptInput(data);
+  }
+
+  private handlePromptInput(data: string): void {
+    if (this.handleBracketedPasteInput(data)) return;
+
     if (data === "\x1b[A") {
       this.replaceInput(this.previousHistory());
       return;
@@ -280,16 +321,58 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
       return;
     }
 
+    if (isMultilinePasteInput(data)) {
+      this.appendInputText(normalizePastedInput(data));
+      return;
+    }
+
     for (const char of data) {
-      if (char === "\r") {
+      if (char === "\r" || char === "\n") {
         void this.submitInput();
       } else if (char === "\x7f") {
         this.backspace();
       } else if (char >= " " || char === "\t") {
-        this.input += char;
-        this.write(char);
+        this.appendInputText(char);
       }
     }
+  }
+
+  private handleBracketedPasteInput(data: string): boolean {
+    const start = "\x1b[200~";
+    const end = "\x1b[201~";
+
+    if (this.bracketedPasteBuffer !== undefined) {
+      const endIndex = data.indexOf(end);
+      if (endIndex === -1) {
+        this.bracketedPasteBuffer += data;
+        return true;
+      }
+
+      const pasted = this.bracketedPasteBuffer + data.slice(0, endIndex);
+      this.bracketedPasteBuffer = undefined;
+      this.appendInputText(normalizePastedInput(pasted));
+      const after = data.slice(endIndex + end.length);
+      if (after) this.handlePromptInput(after);
+      return true;
+    }
+
+    const startIndex = data.indexOf(start);
+    if (startIndex === -1) return false;
+
+    const before = data.slice(0, startIndex);
+    if (before) this.handlePromptInput(before);
+
+    const rest = data.slice(startIndex + start.length);
+    const endIndex = rest.indexOf(end);
+    if (endIndex === -1) {
+      this.bracketedPasteBuffer = rest;
+      return true;
+    }
+
+    this.appendInputText(normalizePastedInput(rest.slice(0, endIndex)));
+    const after = rest.slice(endIndex + end.length);
+    if (after) this.handlePromptInput(after);
+    return true;
   }
 
   private async submitInput(): Promise<void> {
@@ -427,14 +510,51 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
   }
 
   private replaceInput(next: string): void {
-    this.write(`\r\x1b[2Kalpha> ${next}`);
+    this.clearRenderedInput();
     this.input = next;
+    this.renderPromptWithInput(next);
   }
 
   private backspace(): void {
     if (!this.input.length) return;
+    if (this.input.endsWith("\n")) {
+      this.input = this.input.slice(0, -1);
+      this.clearRenderedInput(this.input + "\n");
+      this.renderPromptWithInput(this.input);
+      return;
+    }
     this.input = this.input.slice(0, -1);
     this.write("\b \b");
+  }
+
+  private appendInputText(text: string): void {
+    if (!text) return;
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const parts = normalized.split("\n");
+    for (let index = 0; index < parts.length; index += 1) {
+      if (index > 0) {
+        this.input += "\n";
+        this.write("\r\n... ");
+      }
+      const part = parts[index];
+      if (!part) continue;
+      this.input += part;
+      this.write(part);
+    }
+  }
+
+  private clearRenderedInput(value = this.input): void {
+    const lineCount = terminalInputLineCount(value);
+    if (lineCount > 1) this.write(`\x1b[${lineCount - 1}F`);
+    this.write("\r\x1b[J");
+  }
+
+  private renderPromptWithInput(value: string): void {
+    const lines = value.split("\n");
+    this.write(`${this.promptLabel()}> ${lines[0] ?? ""}`);
+    for (const line of lines.slice(1)) {
+      this.write(`\r\n... ${line}`);
+    }
   }
 
   private renderHistory(): void {
@@ -958,6 +1078,20 @@ function rememberTerminalTurn(session: AlphaSessionState, prompt: string, respon
 
 function normalizeTerminalText(text: string): string {
   return text.replace(/\r?\n/g, "\r\n");
+}
+
+function isMultilinePasteInput(data: string): boolean {
+  if (data.includes("\x1b[200~") || data.includes("\x1b[201~")) return false;
+  if (!/[\r\n]/.test(data)) return false;
+  return data.length > 1;
+}
+
+function normalizePastedInput(data: string): string {
+  return data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function terminalInputLineCount(value: string): number {
+  return Math.max(1, value.split("\n").length);
 }
 
 function formatTerminalDate(value: string): string {
