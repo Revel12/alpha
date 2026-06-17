@@ -241,6 +241,12 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
 
   handleInput(data: string): void {
     if (this.keyDebug) {
+      if (data === "\x03" || data === "\x1b") {
+        this.keyDebug = false;
+        this.writeLine("Key debug disabled.");
+        this.prompt();
+        return;
+      }
       this.writeLine(formatKeyDebugInput(data));
       return;
     }
@@ -317,7 +323,7 @@ class AlphaPseudoTerminal implements vscode.Pseudoterminal {
     }
     if (promptInput === "/keydebug") {
       this.keyDebug = true;
-      this.writeLine("Key debug enabled. Press keys/paste text to inspect raw input. Reload/close terminal to exit debug mode.");
+      this.writeLine("Key debug enabled. Press keys/paste text to inspect raw input. Press Esc or Ctrl+C to exit debug mode.");
       this.prompt();
       return;
     }
@@ -986,16 +992,55 @@ function truncateMiddle(value: string, max: number): string {
 }
 
 function formatKeyDebugInput(data: string): string {
-  const codes = [...data].map((char) => {
+  const chars = [...data];
+  const codes = chars.slice(0, 32).map((char) => {
     const code = char.codePointAt(0) ?? 0;
     return `${JSON.stringify(char)} U+${code.toString(16).toUpperCase().padStart(4, "0")}`;
   });
-  const escaped = data
+  const escaped = escapeTerminalInput(data);
+  const labels = keyDebugLabels(data);
+  const counts = [
+    `chars=${chars.length}`,
+    `bytes=${Buffer.byteLength(data, "utf8")}`,
+    `CR=${countMatches(data, "\r")}`,
+    `LF=${countMatches(data, "\n")}`,
+    `ESC=${countMatches(data, "\x1b")}`,
+  ];
+  const codeSuffix = chars.length > 32 ? ` ... +${chars.length - 32} more` : "";
+  const boundedEscaped = escaped.length > 240 ? `${escaped.slice(0, 240)}...` : escaped;
+  return [
+    `keydebug: ${labels.length ? `${labels.join(", ")} | ` : ""}${counts.join(" ")}`,
+    `  escaped: ${JSON.stringify(boundedEscaped)}`,
+    `  codes: ${codes.join(" ")}${codeSuffix}`,
+  ].join("\r\n");
+}
+
+function keyDebugLabels(data: string): string[] {
+  const labels: string[] = [];
+  if (data === "\r") labels.push("Enter");
+  if (data === "\x1b[Z") labels.push("Shift+Tab");
+  if (data.includes("\x1b[200~")) labels.push("bracketed-paste-start");
+  if (data.includes("\x1b[201~")) labels.push("bracketed-paste-end");
+  if (data.includes("\x1b[13;2u")) labels.push("possible-Shift+Enter");
+  if (data.includes("\n") || data.includes("\r")) labels.push("contains-newline");
+  return labels;
+}
+
+function escapeTerminalInput(data: string): string {
+  return data
     .replace(/\x1b/g, "\\x1b")
     .replace(/\r/g, "\\r")
     .replace(/\n/g, "\\n")
-    .replace(/\t/g, "\\t");
-  return `keydebug: ${JSON.stringify(escaped)} :: ${codes.join(" ")}`;
+    .replace(/\t/g, "\\t")
+    .replace(/\x04/g, "\\x04");
+}
+
+function countMatches(input: string, needle: string): number {
+  let count = 0;
+  for (let index = input.indexOf(needle); index >= 0; index = input.indexOf(needle, index + needle.length)) {
+    count += 1;
+  }
+  return count;
 }
 
 async function handleAlphaRequest(
